@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prism-infer"
+version = "0.0.1"
+authors = [{ name = "SparkSnail" }]
+license = "MIT"
+license-files = ["LICENSE"]
+readme = "README.md"
+description = "LLM inference engine, a fork of nano-vllm with extensions (MoE, PD disaggregation, EP, etc.)"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "torch>=2.4.0",
+    "triton>=3.0.0",
+    "transformers>=4.51.0",
+    "flash-attn",
+    "xxhash",
+]
+
+[project.urls]
+Homepage="https://github.com/SparkSnail/prism-infer"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["prism_infer*"]
