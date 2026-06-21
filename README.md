@@ -88,6 +88,15 @@ python example.py
 python bench.py # MOE not supported yet, Dense only
 ```
 
+## Testing
+
+Unit tests run on CPU.
+
+```bash
+pip install pytest
+python -m pytest tests/ -q
+```
+
 ## Acknowledgements & License
 
 Built on [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) by GeeeekExplorer (Xingkai Yu). MIT licensed, see [LICENSE](LICENSE) for the dual copyright notice.
