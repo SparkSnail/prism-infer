@@ -3,7 +3,6 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from prism_infer.utils.context import get_context
 
 
@@ -57,6 +56,10 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        # Imported lazily: flash-attn requires CUDA and is only needed at forward
+        # time, so importing this module on CPU (unit tests / CI) does not require
+        # flash-attn to be installed.
+        from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():

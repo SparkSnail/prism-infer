@@ -10,6 +10,12 @@
   <a href="#quick-start"><b>Quick Start</b></a>
 </p>
 
+<p align="center">
+  <a href="https://github.com/SparkSnail/prism-infer/actions/workflows/ci.yml">
+    <img src="https://github.com/SparkSnail/prism-infer/actions/workflows/ci.yml/badge.svg" alt="CI"/>
+  </a>
+</p>
+
 **prism-infer** is a minimal LLM inference engine focused on getting single-instance inference **correct, fast, and memory-efficient**: KV cache management, two-phase scheduling, and Qwen3 MoE/Dense forward.
 
 It started as a fork of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) and extends it with battle-tested **scheduling / state / fault-tolerance** mechanisms at the inference engine layer.
@@ -27,21 +33,35 @@ Implemented:
 
 ## Installation
 
-Requires an NVIDIA CUDA GPU (`flash-attn` / `triton`).
-
 Runtime support:
 
 - Supported: Linux (Ubuntu), or Windows + WSL2 (Ubuntu)
 - Not supported: native Windows Python runtime, macOS
 
-Quick checks:
+### Environment setup (prerequisites)
+
+prism-infer needs an NVIDIA CUDA GPU plus a matching PyTorch and `flash-attn`.
+
+1. **PyTorch** install the build matching your CUDA version, see
+   [pytorch.org/get-started](https://pytorch.org/get-started/locally/).
+2. **flash-attn** CUDA-only, and **not** installed by `pip install -e .` 
+ Pick one:
+   - *Prebuilt wheel (recommended, fast):* download the wheel matching your
+     torch / CUDA / Python / C++ ABI from the
+     [flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases),
+     then `pip install <downloaded-wheel>.whl`.
+   - *From source (needs CUDA toolkit / `nvcc`):* `pip install flash-attn --no-build-isolation`.
+
+Verify the environment:
 
 ```bash
 python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
 python -c "import flash_attn, triton; print('ok')"
 ```
 
-Use the same installation commands on Linux and WSL2 (Ubuntu):
+### Install
+
+Same commands on Linux and WSL2 (Ubuntu):
 
 ```bash
 git clone https://github.com/SparkSnail/prism-infer.git
@@ -49,7 +69,7 @@ cd prism-infer
 pip install -e .
 ```
 
-For Windows users, run the commands above inside a WSL2 Ubuntu shell.
+Windows users: run the commands above inside a WSL2 Ubuntu shell.
 
 ## Model Download
 
@@ -62,7 +82,7 @@ For Windows users, run the commands above inside a WSL2 Ubuntu shell.
 pip install modelscope   # or use huggingface-cli
 
 # Dense (default)
-modelscope download --model Qwen/Qwen3-0.6B --local_dir ~/huggingface/Qwen3-0.6B
+modelscope download --model Qwen/Qwen3-0.6B --local_dir ~/models/Qwen3-0.6B
 
 # MoE (large, ~60GB BF16)
 modelscope download --model Qwen/Qwen3-30B-A3B --local_dir ~/models/Qwen3-30B-A3B
@@ -70,30 +90,21 @@ modelscope download --model Qwen/Qwen3-30B-A3B --local_dir ~/models/Qwen3-30B-A3
 
 ## Quick Start
 
-```python
-from prism_infer import LLM, SamplingParams
-
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-outputs = llm.generate(["Hello, prism-infer."], sampling_params)
-print(outputs[0]["text"])
-```
-
-`example.py` and `bench.py` read the model path from the `PRISM_MODEL` env var (default: Dense 0.6B):
+Download a model (see [Model Download](#model-download)), then run the example:
 
 ```bash
-# Switch models via env var
-export PRISM_MODEL=~/models/Qwen3-30B-A3B
+export PRISM_MODEL=~/models/Qwen3-0.6B
 python example.py
-python bench.py # MOE not supported yet, Dense only
 ```
+
+`example.py` read the model directory from the `PRISM_MODEL` env var (a local model folder; defaults to `~/models/Qwen3-0.6B/`).
 
 ## Testing
 
 Unit tests run on CPU.
 
 ```bash
-pip install pytest
+pip install -e ".[test]"
 python -m pytest tests/ -q
 ```
 

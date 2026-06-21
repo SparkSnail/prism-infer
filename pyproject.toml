@@ -15,12 +15,14 @@ dependencies = [
     "torch>=2.4.0",
     "triton>=3.0.0",
     "transformers>=4.51.0",
-    "flash-attn",
     "xxhash",
 ]
 
 [project.optional-dependencies]
 test = ["pytest>=7.0"]
+# flash-attn needs CUDA and is best installed from a prebuilt wheel (see README);
+# kept optional so CPU-only installs / CI do not try to build it from source.
+gpu = ["flash-attn"]
 
 [project.urls]
 Homepage="https://github.com/SparkSnail/prism-infer"
