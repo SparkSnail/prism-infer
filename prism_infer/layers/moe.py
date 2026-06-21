@@ -1,0 +1,76 @@
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+from prism_infer.layers.activation import SiluAndMul
+from prism_infer.layers.linear import (
+    ReplicatedLinear,
+    MergedColumnParallelLinear,
+    RowParallelLinear,
+)
+
+class Qwen3MoEExpert(nn.Module):
+
+    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+        super().__init__()
+
+        self.gate_up_proj = MergedColumnParallelLinear(hidden_size, [intermediate_size] * 2, bias=False)
+        self.down_proj = RowParallelLinear(intermediate_size, hidden_size, bias=False)
+        self.act_fn = SiluAndMul() # silu(gate) * up_proj
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_up = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x = self.down_proj(x)
+        return x
+
+class Qwen3MoE(nn.Module):
+
+    def __init__(self, config) -> None:
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+        self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
+
+        self.gate = ReplicatedLinear(config.hidden_size, self.num_experts, bias=False)
+
+        self.experts = nn.ModuleList([
+            Qwen3MoEExpert(config.hidden_size, config.moe_intermediate_size)
+            for _ in range(self.num_experts)
+        ])
+    
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        orig_shape = hidden_states.shape
+        hidden_dim = orig_shape[-1]
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        num_tokens = hidden_states.shape[0]
+
+        router_logits = self.gate(hidden_states)
+
+        routing_weights = F.softmax(router_logits, dim=-1, dtype=torch.float)
+
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+
+        if self.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        
+        routing_weights = routing_weights.to(hidden_states.dtype)
+       
+        final_hidden_states = torch.zeros(
+           num_tokens, hidden_dim, device=hidden_states.device, dtype=hidden_states.dtype
+        )
+       
+        expert_mask = F.one_hot(selected_experts, num_classes=self.num_experts)
+
+        expert_mask = expert_mask.permute(2, 1, 0)
+
+        for expert_idx in range(self.num_experts):
+            slot_idx, token_idx = torch.where(expert_mask[expert_idx])
+            if token_idx.numel() == 0:
+               continue
+            current_state = hidden_states[token_idx]
+            expert_output = self.experts[expert_idx](current_state)
+            weights = routing_weights[token_idx, slot_idx].unsqueeze(-1)
+            final_hidden_states.index_add_(0, token_idx, expert_output * weights)
+    
+        return final_hidden_states.view(orig_shape)

@@ -9,6 +9,7 @@ from prism_infer.layers.layernorm import RMSNorm
 from prism_infer.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from prism_infer.layers.rotary_embedding import get_rope
 from prism_infer.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from prism_infer.layers.moe import Qwen3MoE
 
 
 class Qwen3Attention(nn.Module):
@@ -117,11 +118,27 @@ class Qwen3MLP(nn.Module):
         return x
 
 
+def _is_moe_layer(config, layer_idx: int) -> bool:
+    # 逐层判定：该层用 MoE 还是 Dense MLP（对齐 HF Qwen3-MoE）
+    #   1. 无 MoE（num_experts 缺失或 0）→ Dense
+    #   2. layer_idx 在 mlp_only_layers 里 → 强制 Dense
+    #   3. 否则按 (layer_idx + 1) % decoder_sparse_step == 0（30B-A3B：step=1 → 全 MoE）
+    num_experts = getattr(config, "num_experts", 0) or 0
+    if num_experts <= 0:
+        return False
+    mlp_only_layers = getattr(config, "mlp_only_layers", None) or []
+    if layer_idx in mlp_only_layers:
+        return False
+    sparse_step = getattr(config, "decoder_sparse_step", 1) or 1
+    return (layer_idx + 1) % sparse_step == 0
+
+
 class Qwen3DecoderLayer(nn.Module):
 
     def __init__(
         self,
         config: Qwen3Config,
+        layer_idx: int = 0,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -135,7 +152,7 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        self.mlp = Qwen3MLP(
+        self.mlp = Qwen3MoE(config) if _is_moe_layer(config, layer_idx) else Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -167,7 +184,7 @@ class Qwen3Model(nn.Module):
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen3DecoderLayer(config, i) for i in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
