@@ -119,10 +119,10 @@ class Qwen3MLP(nn.Module):
 
 
 def _is_moe_layer(config, layer_idx: int) -> bool:
-    # 逐层判定：该层用 MoE 还是 Dense MLP（对齐 HF Qwen3-MoE）
-    #   1. 无 MoE（num_experts 缺失或 0）→ Dense
-    #   2. layer_idx 在 mlp_only_layers 里 → 强制 Dense
-    #   3. 否则按 (layer_idx + 1) % decoder_sparse_step == 0（30B-A3B：step=1 → 全 MoE）
+    # Check if the layer is a MoE layer based on the configuration and layer index.
+    #   1. num_experts <= 0 -> Dense
+    #   2. layer_idx in mlp_only_layers -> Dense
+    #   3. Otherwise, use (layer_idx + 1) % decoder_sparse_step == 0 (30B-A3B: step=1 -> all MoE)
     num_experts = getattr(config, "num_experts", 0) or 0
     if num_experts <= 0:
         return False
