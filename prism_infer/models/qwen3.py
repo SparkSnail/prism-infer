@@ -9,7 +9,7 @@ from prism_infer.layers.layernorm import RMSNorm
 from prism_infer.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from prism_infer.layers.rotary_embedding import get_rope
 from prism_infer.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-from prism_infer.layers.moe import Qwen3MoE
+from prism_infer.layers.moe import MoE
 
 
 class Qwen3Attention(nn.Module):
@@ -152,7 +152,13 @@ class Qwen3DecoderLayer(nn.Module):
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        self.mlp = Qwen3MoE(config) if _is_moe_layer(config, layer_idx) else Qwen3MLP(
+        self.mlp = MoE(
+            hidden_size=config.hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            num_experts=config.num_experts,
+            top_k=config.num_experts_per_tok,
+            norm_topk_prob=getattr(config, "norm_topk_prob", True),
+        ) if _is_moe_layer(config, layer_idx) else Qwen3MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,

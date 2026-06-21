@@ -82,7 +82,8 @@ print(outputs[0]["text"])
 `example.py` and `bench.py` read the model path from the `PRISM_MODEL` env var (default: Dense 0.6B):
 
 ```bash
-PRISM_MODEL=~/models/Qwen3-30B-A3B python example.py # Switch models via env var
+# Switch models via env var
+export PRISM_MODEL=~/models/Qwen3-30B-A3B
 python example.py
 python bench.py # MOE not supported yet, Dense only
 ```
