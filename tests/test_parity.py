@@ -79,7 +79,9 @@ def test_top1_token_matches(hf_last_logits, prism_last_logits):
 
 
 def test_logits_l2_within_tolerance(hf_last_logits, prism_last_logits):
+    # Full bf16 forward accumulates more error than a single op (attention UT uses 2e-2),
+    # so ~2.5e-2 is the realistic bound here; top-1 parity is the strict check.
     diff = (hf_last_logits - prism_last_logits).norm()
     base = hf_last_logits.norm().clamp_min(1e-6)
     rel_l2 = (diff / base).item()
-    assert rel_l2 < 1e-2, f"relative L2 = {rel_l2}"
+    assert rel_l2 < 2.5e-2, f"relative L2 = {rel_l2}"

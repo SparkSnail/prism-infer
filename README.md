@@ -94,11 +94,18 @@ PRISM_MODEL=~/models/Qwen3-0.6B python example.py
 
 ## Testing
 
-Unit tests run on CPU.
+**Unit tests run on CPU.**
 
 ```bash
 pip install -e ".[test]"
 python -m pytest tests/ -q
+```
+**E2E Parity Tests**
+
+The parity tests (single-step and end-to-end token parity vs HuggingFace) need a CUDA GPU, flash-attn, and a local model. They are skipped unless `PRISM_TEST_MODEL` points to a local model directory:
+
+```bash
+PRISM_TEST_MODEL=~/models/Qwen3-0.6B python -m pytest tests/ -q
 ```
 
 ## Benchmark
