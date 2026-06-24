@@ -32,6 +32,10 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        if config.cpu_offload_blocks > 0 and config.tensor_parallel_size == 1:
+            from prism_infer.engine.kv_offloader import KVOffloader
+            self.scheduler.block_manager.offloader = KVOffloader(
+                self.model_runner.kv_cache, config.cpu_offload_blocks)
         atexit.register(self.exit)
 
     def exit(self):
