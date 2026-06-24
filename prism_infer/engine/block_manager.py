@@ -1,4 +1,4 @@
-from collections import deque
+from collections import deque, OrderedDict
 import xxhash
 import numpy as np
 
@@ -31,6 +31,8 @@ class BlockManager:
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
+        self.evictable: OrderedDict[int, None] = OrderedDict()
+        self.evict_count = 0
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -39,13 +41,29 @@ class BlockManager:
             h.update(prefix.to_bytes(8, "little"))
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
-
-    def _allocate_block(self) -> int:
-        block_id = self.free_block_ids.popleft()
+    
+    def _num_available(self) -> int:
+        # Evictable blocks can be reclaimed, so we can use them to satisfy the allocation request.
+        return len(self.free_block_ids) + len(self.evictable)
+    
+    def _evict_one(self) -> int:
+        # Evict the least recently used block and return its block_id.
+        block_id, _ = self.evictable.popitem(last=False)
         block = self.blocks[block_id]
-        assert block.ref_count == 0
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
+        self.evict_count += 1
+        return block_id
+
+    def _allocate_block(self) -> int:
+        # Allocate a block and return its block_id. 
+        # If no free blocks are available, evict one.
+        if self.free_block_ids:
+            block_id = self.free_block_ids.popleft()
+        else:
+            block_id = self._evict_one()
+        block = self.blocks[block_id]
+        assert block.ref_count == 0
         block.reset()
         self.used_block_ids.add(block_id)
         return block_id
@@ -53,7 +71,12 @@ class BlockManager:
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
+        # If the block hash is valid, it can be put into the evictable list for future reuse.
+        # Otherwise, it is simply added to the free list.
+        if self.blocks[block_id].hash != -1:
+            self.evictable[block_id] = None
+        else:
+            self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
@@ -68,7 +91,7 @@ class BlockManager:
             num_cached_blocks += 1
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
-        if len(self.free_block_ids) < num_new_blocks:
+        if self._num_available() < num_new_blocks:
             return -1
         return num_cached_blocks
 
@@ -84,7 +107,8 @@ class BlockManager:
                 block.ref_count += 1
             else:
                 block.ref_count = 1
-                self.free_block_ids.remove(block_id)
+                # If the block is in the evictable list, remove it from there and add it to the used list.
+                del self.evictable[block_id]
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
         for i in range(num_cached_blocks, seq.num_blocks):
@@ -101,7 +125,7 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        return self._num_available() >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
         if len(seq) % self.block_size == 1:
