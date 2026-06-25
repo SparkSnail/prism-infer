@@ -17,6 +17,12 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # multi-GPU: generated once by LLMEngine and passed to all ranks via Config.
+    # 0 / "" mean "auto": a free TCP port and a unique shm name (PID/UUID).
+    # Replaces hardcoded port 2333 / shm name "prism_infer" which caused
+    # EADDRINUSE / FileExistsError on multi-GPU re-runs.
+    master_port: int = 0
+    shm_name: str = ""
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

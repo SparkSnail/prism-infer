@@ -29,6 +29,54 @@ PRISM_MODEL=~/models/Qwen3-30B-A3B python bench/bench.py sweep --eager --batch-s
 
 Common flags: `--num-seqs` (concurrency), `--input-len`, `--output-len`, `--max-model-len`, `--batch-sizes` (sweep), `--eager`.
 
+## Multi-GPU (tensor parallel)
+
+Pass `--tp N` to run on N GPUs (needs N visible GPUs). `tp_parity.py` checks that
+TP=N produces the same tokens as TP=1.
+
+```bash
+# TP scaling throughput (1 vs 2 GPUs)
+PRISM_MODEL=~/models/Qwen3-0.6B python bench/bench.py throughput --tp 1
+PRISM_MODEL=~/models/Qwen3-0.6B python bench/bench.py throughput --tp 2
+
+# TP=1 vs TP=2 token parity (first-token + full-sequence)
+python bench/tp_parity.py --model ~/models/Qwen3-0.6B --max-tokens 32
+```
+
+> [!Note]
+> On hosts where GPU peer-to-peer (P2P) over PCIe is not available, NCCL **hangs** during the first collective (both GPUs stuck at 100% util).   
+> Prefix multi-GPU runs with `NCCL_P2P_DISABLE=1`:
+> ```bash
+> NCCL_P2P_DISABLE=1 python bench/tp_parity.py --model ~/models/Qwen3-0.6B
+> ```
+
+### TP parity result (2xA800)
+
+TP=1 vs TP=2, `temperature=1e-6` (near-argmax), eager:
+
+- **Dense (Qwen3-0.6B)**: first token matches (both ` Paris`), first 5 tokens identical, diverge at index 5 at a near-tie branch.
+- **MoE (Qwen3-30B-A3B)**: first token matches, first 13 tokens identical, diverge at index 14, this also exercises the expert-sharding TP path (MergedColumn/Row parallel experts), confirming MoE TP forward is correct.
+
+
+### TP scaling (2xA800, NCCL_P2P_DISABLE=1)
+
+**Dense (Qwen3-0.6B, cuda-graph)**: num_seqs=64, input 512 / output 256:
+
+| | prefill tok/s | decode TPS | e2e tok/s | batch-TTFT |
+|---|---|---|---|---|
+| TP=1 | 68 213 | 10 670 | 8 150 | 487 ms |
+| TP=2 | 41 918 | 7 495 | 5 536 | 791 ms |
+
+**MoE (Qwen3-30B-A3B, eager)**: num_seqs=32, input 512 / output 64:
+
+| | prefill tok/s | decode TPS | e2e tok/s | batch-TTFT |
+|---|---|---|---|---|
+| TP=1 | 5 360 | 28.6 | 27.8 | 3 981 ms |
+| TP=2 | 2 259 | 21.6 | 20.4 | 8 403 ms |
+
+#### Analysis
+**TP=2 is slower than TP=1 in both cases (~0.68x Dense, ~0.73x MoE)**, it's expected instead of a regression. At these sizes the per-layer all_reduce communication outweighs the compute saved by splitting, and with P2P disabled the cross-GPU path falls back to the slower host/SHM transport. Both models fit on a single 80GB A800, so TP is unnecessary here. TP pays off only when a single GPU is compute- or memory-bound: it is a capacity enabler (fit bigger models), not a small-model speedup.
+
 ## Baseline results
 
 ### Environment

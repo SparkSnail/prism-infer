@@ -1,4 +1,7 @@
 import atexit
+import os
+import socket
+import uuid
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -12,6 +15,13 @@ from prism_infer.engine.scheduler import Scheduler
 from prism_infer.engine.model_runner import ModelRunner
 
 
+def _find_free_port() -> int:
+    # Bind to port 0 so the OS picks a free port; release it and reuse the number.
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
@@ -19,6 +29,15 @@ class LLMEngine:
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
         Sequence.block_size = config.kvcache_block_size
+        # Generate a unique NCCL port + shm name once, before spawning workers,
+        # so rank 0 and all workers (which receive Config via pickle) agree.
+        # The port is always needed: even TP=1 calls init_process_group(world_size=1),
+        # and port 0 makes torch raise "port number missing". The shm name is only
+        # used for TP>1 worker communication.
+        if config.master_port == 0:
+            config.master_port = _find_free_port()
+        if config.tensor_parallel_size > 1 and not config.shm_name:
+            config.shm_name = f"prism_infer_{os.getpid()}_{uuid.uuid4().hex[:8]}"
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")

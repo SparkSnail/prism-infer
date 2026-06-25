@@ -23,7 +23,7 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        dist.init_process_group("nccl", f"tcp://localhost:{config.master_port}", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
@@ -40,11 +40,11 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
-                self.shm = SharedMemory(name="prism_infer", create=True, size=2**20)
+                self.shm = SharedMemory(name=config.shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="prism_infer")
+                self.shm = SharedMemory(name=config.shm_name)
                 self.loop()
 
     def exit(self):
@@ -110,8 +110,14 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        # Respect an explicit num_kvcache_blocks (>0); per-rank auto-estimation
+        # from mem_get_info is unstable under concurrent TP init.
+        if config.num_kvcache_blocks <= 0:
+            config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        assert config.num_kvcache_blocks > 0, (
+            f"num_kvcache_blocks={config.num_kvcache_blocks} (free={free}, total={total}, "
+            f"used={used}, peak={peak}, current={current}, block_bytes={block_bytes})"
+        )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
