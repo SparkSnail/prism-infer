@@ -68,7 +68,10 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
+        # The sole running seq preempted itself (free+evictable exhausted).
+        # It has been requeued; return empty so the caller skips this step gracefully.
+        if not scheduled_seqs:
+            return [], False
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 

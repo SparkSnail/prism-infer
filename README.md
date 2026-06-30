@@ -27,7 +27,7 @@ It started as a fork of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)
 - [x] **Tensor parallelism**: column/row-parallel linear, fused QKV / gate-up projections
 - [x] **CUDA graph**: capture for decode, Torch compilation for fused ops
 - [x] **Qwen3 Dense** forward: GQA + QK-norm + RoPE (θ=1e6)
-- [x] **Qwen3-MoE** forward: router top-k of N + SwiGLU experts with re-norm
+- [x] **Qwen3-MoE** forward: router top-k of N + SwiGLU experts with re-norm, expert parallel
 
 ## Installation
 
@@ -100,6 +100,7 @@ PRISM_MODEL=~/models/Qwen3-0.6B python example.py
 pip install -e ".[test]"
 python -m pytest tests/ -q
 ```
+
 **E2E Parity Tests**
 
 The parity tests (single-step and end-to-end token parity vs HuggingFace) need a CUDA GPU, flash-attn, and a local model. They are skipped unless `PRISM_TEST_MODEL` points to a local model directory:
@@ -108,12 +109,25 @@ The parity tests (single-step and end-to-end token parity vs HuggingFace) need a
 PRISM_TEST_MODEL=~/models/Qwen3-0.6B python -m pytest tests/ -q
 ```
 
+**MoE E2E Parity Tests**
+
+MoE-specific tests use a separate env var so they don't interfere with the Dense test suite. Run them after the standard suite, not together:
+
+```bash
+# Single-GPU MoE forward + scheduler parity (needs >=40 GB VRAM)
+PRISM_TEST_MOE_MODEL=~/models/Qwen3-30B-A3B python -m pytest tests/test_parity_moe_e2e.py -v
+
+# EP=2 logits parity (needs >=2 GPUs; run after the above to avoid OOM)
+PRISM_TEST_MOE_MODEL=~/models/Qwen3-30B-A3B python -m pytest tests/test_parity_ep.py -v
+```
+
+
 ## Benchmark
 
 `bench/bench.py` measures **TTFT**, **prefill throughput**, **decode TPS**, and a **throughput-vs-batch-size** curve, for both Dense and MoE models.
 
 More details refer [bench/README.md](bench/README.md).
 
-## Acknowledgements & License
+## License
 
-Built on [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) by GeeeekExplorer (Xingkai Yu). MIT licensed, see [LICENSE](LICENSE) for the dual copyright notice.
+MIT — see [LICENSE](LICENSE).

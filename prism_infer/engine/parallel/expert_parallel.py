@@ -72,6 +72,19 @@ class _PlainExpert(nn.Module):
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.act_fn = SiluAndMul()
 
+        # The checkpoint stores gate_proj and up_proj as separate [I, H] tensors
+        # (shard_id 0 and 1). Write each into the corresponding half of the fused
+        # [2I, H] parameter. Without this, the up_proj load (shard_id=1) would
+        # overwrite the entire parameter, silently corrupting gate_proj.
+        def _gate_up_weight_loader(param, loaded_weight, shard_id):
+            half = param.data.shape[0] // 2
+            if shard_id == 0:
+                param.data[:half].copy_(loaded_weight)
+            else:
+                param.data[half:].copy_(loaded_weight)
+
+        self.gate_up_proj.weight.weight_loader = _gate_up_weight_loader
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(self.act_fn(self.gate_up_proj(x)))
 

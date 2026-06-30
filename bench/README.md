@@ -114,3 +114,23 @@ TP=1 vs TP=2, `temperature=1e-6` (near-argmax), eager:
 - **Dense (CUDA graph)** scales decode throughput near-linearly up to batch 64 (402 -> 10 714 TPS), as expected when per-step kernel launch overhead is amortized by the captured graph.
 - **MoE (eager)** is **per-step-overhead bound**: decode TPS also scales near-linearly with batch (2.4-> 47.9 TPS), and single-stream decode is only ~2.4 tok/s (~0.42 s/token). The eager path has no CUDA graph and runs Python-side expert routing every step.
 - This MoE eager number is the **"before" baseline** for future work on CUDA-graph support / routing optimization for the MoE path.
+
+## Multi-GPU (expert parallel)
+
+For MoE models, `--ep N` shards experts across N GPUs (true expert parallelism: all-to-all dispatch/combine), as opposed to TP-of-experts.
+
+```bash
+# EP throughput
+NCCL_P2P_DISABLE=1 PRISM_MODEL=~/models/Qwen3-30B-A3B python bench/bench.py throughput --eager --ep 2 --num-seqs 32 --output-len 64
+```
+
+### EP scaling (Qwen3-30B-A3B, 2xA800, eager)
+
+num_seqs=32, input 512 / output 64:
+
+| | prefill tok/s | decode TPS | e2e tok/s | batch-TTFT |
+|---|---|---|---|---|
+| EP=1 | 5 633 | 31.6 | 30.7 | 3 792 ms |
+| EP=2 | 3 369 | 43.0 | 39.6 | 5 429 ms |
+
+**EP=2 decode TPS +36%, e2e +29%** vs EP=1, expert sharding halves per-card MoE compute. Prefill and TTFT are slower (~-40%) because each EP step requires an all-to-all collective; with P2P disabled the cross-GPU path uses the slower host/SHM transport, and prefill has more tokens per step so the communication overhead is higher. EP is a capacity enabler and decode accelerator, not a prefill speedup.

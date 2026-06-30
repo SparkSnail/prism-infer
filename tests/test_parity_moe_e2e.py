@@ -1,8 +1,18 @@
+# test_parity_moe_e2e.py -- end-to-end greedy token parity for MoE models
+#
+# Coverage: same scheduler + paged BlockManager + KV cache path as test_parity_e2e.py,
+# but exercises the MoE forward (router + expert dispatch + combine) and confirms the
+# full generation loop produces the same tokens as HuggingFace greedy on Qwen3-MoE.
+#
+# Both prism (temperature=0 → argmax) and HF (do_sample=False → argmax) take the exact
+# same greedy path.  Flash-attn vs SDPA BF16 differences can cause near-tie divergence
+# after a few tokens, so MIN_COMMON_PREFIX is intentionally small.
+#
 # Prerequisites:
-#   - PRISM_TEST_MODEL -> a local model dir (with config.json + safetensors)
-#       export PRISM_TEST_MODEL=~/huggingface/Qwen3-0.6B
-#   - A CUDA GPU + flash-attn
-#   Automatically skipped when unset or no GPU.
+#   - PRISM_TEST_MOE_MODEL -> a local MoE model dir (e.g. Qwen3-30B-A3B)
+#       export PRISM_TEST_MOE_MODEL=~/autodl-tmp/Qwen3-30B-A3B
+#   - A CUDA GPU with enough VRAM (>=40 GB for Qwen3-30B-A3B BF16) + flash-attn
+#   Automatically skipped when unset, no GPU, or model is not MoE.
 import os
 import atexit
 
@@ -10,20 +20,29 @@ import pytest
 import torch
 import torch.distributed as dist
 
-MODEL_PATH = os.environ.get("PRISM_TEST_MODEL")
+MODEL_PATH = os.environ.get("PRISM_TEST_MOE_MODEL")
 PROMPT = "The capital of France is"
 N_TOKENS = 32
-MIN_COMMON_PREFIX = 5  # flash-attn vs SDPA BF16 near-tie divergence is expected; 5 tokens is enough to prove the scheduler/KV-cache path is correct
+MIN_COMMON_PREFIX = 5  # flash-attn vs SDPA BF16 near-tie divergence is expected
 
 pytest.importorskip("flash_attn")
 if not torch.cuda.is_available():
-    pytest.skip("e2e parity UT requires CUDA GPU", allow_module_level=True)
+    pytest.skip("MoE e2e parity UT requires CUDA GPU", allow_module_level=True)
 if not MODEL_PATH or not os.path.isdir(MODEL_PATH):
-    pytest.skip("set PRISM_TEST_MODEL to a local model dir", allow_module_level=True)
+    pytest.skip("set PRISM_TEST_MOE_MODEL to a local MoE model dir", allow_module_level=True)
 
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer  # noqa: E402
 
 from prism_infer import LLM, SamplingParams  # noqa: E402
+
+# Verify the model is actually MoE; skip silently if it's a dense model.
+_hf_cfg = AutoConfig.from_pretrained(MODEL_PATH)
+if not hasattr(_hf_cfg, "num_experts"):
+    pytest.skip(
+        f"PRISM_TEST_MOE_MODEL ({MODEL_PATH}) does not look like a MoE model "
+        "(no num_experts in config); set it to a Qwen3-MoE checkpoint",
+        allow_module_level=True,
+    )
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -38,7 +57,6 @@ def _release_distributed():
     if dist.is_initialized():
         dist.destroy_process_group()
     dist.init_process_group(backend="gloo", rank=0, world_size=1)
-
 
 
 @pytest.fixture(scope="module")
@@ -62,7 +80,7 @@ def hf_greedy_ids():
             do_sample=False,
             num_beams=1,
         )
-    gen = out[0, input_ids.shape[1] :].tolist()
+    gen = out[0, input_ids.shape[1]:].tolist()
     del model
     torch.cuda.empty_cache()
     return gen
@@ -70,25 +88,22 @@ def hf_greedy_ids():
 
 @pytest.fixture(scope="module")
 def prism_greedy_ids(hf_greedy_ids):
-    # Depend on hf_greedy_ids so the HF model is built and freed first: this keeps the
-    # GPU clear for prism's KV cache and avoids HF loading while the engine has set the
-    # default device to cuda.
-    prev_device = torch.tensor(0.0).device  # current default device
-    # Low gpu_memory_utilization: this test needs only one short sequence, so keep the
-    # KV cache small and avoid a huge allocation failing on a fragmented / small GPU.
+    # Depend on hf_greedy_ids so the HF model is built and freed first.
+    prev_device = torch.tensor(0.0).device
+    # MoE model requires enforce_eager (no CUDA graph support yet).
+    # Use high gpu_memory_utilization since the 30B model needs most of the VRAM;
+    # num_kvcache_blocks is set explicitly to avoid auto-estimation instability.
     llm = LLM(
         MODEL_PATH,
         enforce_eager=True,
         tensor_parallel_size=1,
         max_model_len=2048,
-        gpu_memory_utilization=0.4,
+        gpu_memory_utilization=0.9,
+        num_kvcache_blocks=256,
     )
     sp = SamplingParams(temperature=0, ignore_eos=True, max_tokens=N_TOKENS)
     out = llm.generate([PROMPT], sp, use_tqdm=False)
     ids = out[0]["token_ids"]
-    # exit() frees the engine and destroys its process group. Unregister the atexit
-    # callback the engine installed, otherwise it fires again at process exit and
-    # raises (model_runner already deleted).
     atexit.unregister(llm.exit)
     llm.exit()
     torch.set_default_device(prev_device)

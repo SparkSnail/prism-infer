@@ -84,9 +84,10 @@ def _run(llm: LLM, prompts, params) -> dict:
     }
 
 
-def _build_llm(path: str, eager: bool, max_model_len: int, tp: int = 1) -> LLM:
+def _build_llm(path: str, eager: bool, max_model_len: int, tp: int = 1, ep: int = 1) -> LLM:
     # MoE must run eager (CUDA graph not supported on the MoE path yet).
-    llm = LLM(path, enforce_eager=eager, tensor_parallel_size=tp, max_model_len=max_model_len)
+    llm = LLM(path, enforce_eager=eager, tensor_parallel_size=tp, expert_parallel_size=ep,
+              max_model_len=max_model_len)
     # Warm up so the first timed run is not penalized by lazy init / graph capture.
     llm.generate([[1, 2, 3]], SamplingParams(ignore_eos=True, max_tokens=4), use_tqdm=False)
     return llm
@@ -94,10 +95,10 @@ def _build_llm(path: str, eager: bool, max_model_len: int, tp: int = 1) -> LLM:
 
 def cmd_throughput(args):
     path = os.path.expanduser(os.environ["PRISM_MODEL"])
-    llm = _build_llm(path, args.eager, args.max_model_len, args.tp)
+    llm = _build_llm(path, args.eager, args.max_model_len, args.tp, args.ep)
     prompts, params = _make_requests(args.num_seqs, args.input_len, args.output_len)
     r = _run(llm, prompts, params)
-    print(f"\n=== throughput ({'eager/MoE' if args.eager else 'cuda-graph'}, TP={args.tp}) ===")
+    print(f"\n=== throughput ({'eager/MoE' if args.eager else 'cuda-graph'}, TP={args.tp}, EP={args.ep}) ===")
     print(f"config        : num_seqs={args.num_seqs} input_len={args.input_len} output_len={args.output_len}")
     print(f"prefill tput  : {r['prefill_tput']:.1f} tok/s")
     print(f"decode TPS    : {r['decode_tps']:.1f} tok/s")
@@ -108,7 +109,7 @@ def cmd_throughput(args):
 def cmd_ttft(args):
     # True single-request TTFT: time to produce the first token for one prompt.
     path = os.path.expanduser(os.environ["PRISM_MODEL"])
-    llm = _build_llm(path, args.eager, args.max_model_len, args.tp)
+    llm = _build_llm(path, args.eager, args.max_model_len, args.tp, args.ep)
     prompts, _ = _make_requests(1, args.input_len, 1)
     sp = [SamplingParams(ignore_eos=True, max_tokens=1)]
     llm.add_request(prompts[0], sp[0])
@@ -123,9 +124,9 @@ def cmd_ttft(args):
 
 def cmd_sweep(args):
     path = os.path.expanduser(os.environ["PRISM_MODEL"])
-    llm = _build_llm(path, args.eager, args.max_model_len, args.tp)
+    llm = _build_llm(path, args.eager, args.max_model_len, args.tp, args.ep)
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
-    print(f"\n=== sweep ({'eager/MoE' if args.eager else 'cuda-graph'}, TP={args.tp}) input_len={args.input_len} output_len={args.output_len} ===")
+    print(f"\n=== sweep ({'eager/MoE' if args.eager else 'cuda-graph'}, TP={args.tp}, EP={args.ep}) input_len={args.input_len} output_len={args.output_len} ===")
     print(f"{'batch':>6} | {'decode TPS':>11} | {'e2e tput':>10}")
     print("-" * 34)
     for bs in batch_sizes:
@@ -144,6 +145,7 @@ def main():
     common.add_argument("--num-seqs", type=int, default=64, help="concurrent requests")
     common.add_argument("--max-model-len", type=int, default=4096)
     common.add_argument("--tp", type=int, default=1, help="tensor parallel size (>=2 needs that many GPUs)")
+    common.add_argument("--ep", type=int, default=1, help="expert parallel size for MoE (>=2 needs that many GPUs)")
 
     parser = argparse.ArgumentParser(description="prism-infer benchmark suite", parents=[common])
     sub = parser.add_subparsers(dest="cmd", required=True)

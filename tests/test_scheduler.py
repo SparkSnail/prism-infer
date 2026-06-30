@@ -96,6 +96,58 @@ def test_decode_oom_preempts_running_tail(small_block):
     assert b.block_table == []
     assert len(a.block_table) == 2                     # A grew into the freed block
 
+def test_decode_self_preempt_returns_empty_and_requeues(small_block):
+    # Only 1 block available: A fills it during prefill (4 tokens, block_size=4).
+    # On the next decode step A needs a 2nd block but none exist and the running
+    # queue is already empty -> A preempts itself.
+    # Expected: schedule() returns ([], False) without crashing, A is back in waiting.
+    sch = make_scheduler(num_blocks=1, block_size=4, max_num_batched_tokens=8)
+    a = Sequence([1, 2, 3, 4])
+    sch.add(a)
+    seqs, is_prefill = sch.schedule()          # prefill: allocates the 1 block
+    assert is_prefill is True
+    sch.postprocess(seqs, [1], is_prefill)     # A -> 5 tokens, needs 2nd block next
+
+    seqs2, is_prefill2 = sch.schedule()        # decode: only A, no free block -> self-preempt
+    assert seqs2 == []                         # must not crash, must return empty
+    assert is_prefill2 is False
+    assert a.status == SequenceStatus.WAITING  # A requeued at head of waiting
+    assert a in sch.waiting
+    assert sch.waiting[0] is a
+    assert a.block_table == []                 # KV cache released
+    assert a.is_prefill is True                # reset to prefill mode
+
+
+def test_decode_self_preempt_recovers_on_next_step(small_block):
+    # After self-preemption the scheduler must be able to re-prefill A on the
+    # very next step (the released block is back in the free pool).
+    # Use 2 blocks so that after self-preemption (A has 5 tokens = 2 blocks needed)
+    # there are enough free blocks to re-prefill A.
+    sch = make_scheduler(num_blocks=2, block_size=4, max_num_batched_tokens=8)
+    a = Sequence([1, 2, 3, 4])
+    sch.add(a)
+    seqs, is_prefill = sch.schedule()          # prefill: allocates block 0
+    sch.postprocess(seqs, [1], is_prefill)     # A -> 5 tokens
+
+    # Force OOM by temporarily exhausting all blocks so the first decode triggers
+    # self-preemption. Borrow block 1 via a dummy sequence, then release it after
+    # self-preemption so the re-prefill can proceed.
+    dummy = Sequence([10, 11, 12, 13])
+    sch.block_manager.allocate(dummy, 0)       # occupy block 1 (the only free one)
+
+    seqs2, is_prefill2 = sch.schedule()        # decode: A needs block, none free -> self-preempt
+    assert seqs2 == []
+    assert a.status == SequenceStatus.WAITING
+    assert a.block_table == []
+
+    sch.block_manager.deallocate(dummy)        # free block 1 again
+
+    seqs3, is_prefill3 = sch.schedule()        # A should be re-prefilled successfully
+    assert is_prefill3 is True
+    assert seqs3 == [a]
+    assert a.status == SequenceStatus.RUNNING
+
+
 def test_postprocess_finishes_on_eos(small_block):
     sch = make_scheduler(eos=0)
     a = Sequence([1, 2, 3])

@@ -1,4 +1,5 @@
 import contextlib
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -8,22 +9,23 @@ from prism_infer.layers.linear import (
     RowParallelLinear,
     QKVParallelLinear,
     MergedColumnParallelLinear,
+    set_tp_group,
 )
 from prism_infer.layers.embed_head import VocabParallelEmbedding
+import prism_infer.layers.linear as _linear_mod
+import prism_infer.layers.embed_head as _embed_mod
 
 
 @contextlib.contextmanager
 def simulate_tp(rank: int, world: int):
-    # Layers capture tp_rank/tp_size from dist at construction; patch them so we can build
-    # a "rank r of a tp_size=world" layer in this single process. Restore afterwards.
-    orig_rank, orig_world = dist.get_rank, dist.get_world_size
-    dist.get_rank = lambda *a, **k: rank
-    dist.get_world_size = lambda *a, **k: world
-    try:
+    # _tp_rank()/_tp_size() read _TP_GROUP, not the global dist functions.
+    # Patch the module-level helpers in both linear and embed_head so layers
+    # built inside this context see the simulated rank/world.
+    with patch.object(_linear_mod, "_tp_rank", return_value=rank), \
+         patch.object(_linear_mod, "_tp_size", return_value=world), \
+         patch.object(_embed_mod, "_tp_rank", return_value=rank), \
+         patch.object(_embed_mod, "_tp_size", return_value=world):
         yield
-    finally:
-        dist.get_rank = orig_rank
-        dist.get_world_size = orig_world
 
 
 def test_column_parallel_partitions_rows():

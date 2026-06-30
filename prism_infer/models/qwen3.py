@@ -3,6 +3,7 @@ from torch import nn
 import torch.distributed as dist
 from transformers import Qwen3Config
 
+from prism_infer.layers.linear import _tp_size
 from prism_infer.layers.activation import SiluAndMul
 from prism_infer.layers.attention import Attention
 from prism_infer.layers.layernorm import RMSNorm
@@ -27,7 +28,10 @@ class Qwen3Attention(nn.Module):
         rope_scaling: dict | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size()
+        # Use _tp_size() rather than dist.get_world_size() so that under pure EP
+        # (world_size == ep_size, tp_size == 1) attention heads are not incorrectly
+        # sharded across EP ranks.
+        tp_size = _tp_size()
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size

@@ -51,7 +51,11 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
-        if config.cpu_offload_blocks > 0 and config.tensor_parallel_size == 1:
+        # CPU offload is only safe on single-GPU (TP=1, EP=1): multi-GPU EP has no
+        # mechanism to synchronise per-rank offload state across ranks (planned for I16-A).
+        if (config.cpu_offload_blocks > 0
+                and config.tensor_parallel_size == 1
+                and config.expert_parallel_size == 1):
             from prism_infer.engine.kv_offloader import KVOffloader
             self.scheduler.block_manager.offloader = KVOffloader(
                 self.model_runner.kv_cache, config.cpu_offload_blocks)
@@ -71,6 +75,10 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        # The sole running seq may have self-preempted under extreme memory pressure;
+        # skip the model call and return empty for this step.
+        if not seqs:
+            return [], 0
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
