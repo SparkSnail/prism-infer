@@ -7,6 +7,9 @@ from prism_infer.sampling_params import SamplingParams
 
 class SequenceStatus(Enum):
     WAITING = auto()
+    # PD disaggregation: prefill done, blocks pre-allocated and locked,
+    # waiting for remote KV transfer to complete before scheduling decode.
+    KV_TRANSFERRING = auto()
     RUNNING = auto()
     FINISHED = auto()
 

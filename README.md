@@ -130,4 +130,4 @@ More details refer [bench/README.md](bench/README.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[MIT](LICENSE)

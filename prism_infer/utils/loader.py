@@ -86,3 +86,22 @@ def load_model(model: nn.Module, path: str):
                     param = model.get_parameter(param_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
+
+
+def load_weights_zerocopy(safetensors_path: str, weight_name: str,
+                          param: "nn.Parameter") -> None:
+    """Load one weight tensor via mmap + pinned memory + async H2D DMA."""
+    try:
+        from safetensors import safe_open as _safe_open
+    except ImportError:
+        raise ImportError("safetensors required for load_weights_zerocopy")
+
+    with _safe_open(safetensors_path, framework="pt", device="cpu") as f:
+        if weight_name not in f.keys():
+            raise KeyError(f"{weight_name!r} not found in {safetensors_path}")
+        host = f.get_tensor(weight_name)
+        if not host.is_pinned():
+            host = host.pin_memory()
+        # non_blocking: DMA runs in background, CPU returns immediately.
+        param.data.copy_(host.view(param.data.dtype).reshape(param.data.shape),
+                         non_blocking=True)

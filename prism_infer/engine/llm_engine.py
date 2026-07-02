@@ -52,7 +52,7 @@ class LLMEngine:
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         # CPU offload is only safe on single-GPU (TP=1, EP=1): multi-GPU EP has no
-        # mechanism to synchronise per-rank offload state across ranks (planned for I16-A).
+        # mechanism to synchronise per-rank offload state across ranks.
         if (config.cpu_offload_blocks > 0
                 and config.tensor_parallel_size == 1
                 and config.expert_parallel_size == 1):
@@ -60,6 +60,13 @@ class LLMEngine:
             self.scheduler.block_manager.offloader = KVOffloader(
                 self.model_runner.kv_cache, config.cpu_offload_blocks)
         atexit.register(self.exit)
+        # KVConnector: single choke-point for PD-role behaviour.
+        # unified: no-op;
+        # prefill-only: fires KVBlockPusher;
+        # decode-only: polls KVReceiver.
+        from prism_infer.engine.kv_connector import _build_connector
+        kv_cache = getattr(self.model_runner, "kv_cache", None)
+        self.kv_connector = _build_connector(config, kv_cache=kv_cache)
 
     def exit(self):
         self.model_runner.call("exit")
@@ -82,7 +89,12 @@ class LLMEngine:
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = []
+        for seq in seqs:
+            if is_prefill and seq.num_cached_tokens == seq.num_tokens:
+                self.kv_connector.on_prefill_done(seq)
+            if seq.is_finished:
+                outputs.append((seq.seq_id, seq.completion_token_ids))
         return outputs, num_tokens
 
     def is_finished(self):
