@@ -35,6 +35,15 @@ class ChunkedBlock:
     op_id:      str
 
 
+@dataclass(slots=True)
+class _OpState:
+    """Per-op transfer state tracked inside KVBlockPusher."""
+    total_chunks: int
+    done_chunks:  int
+    dst:          str
+    bytes_done:   int
+
+
 class KVTransportBackend(Protocol):
     """Unified transport interface. KVBlockPusher depends only on this protocol."""
 
@@ -94,8 +103,7 @@ class KVBlockPusher:
         # FIFO deferred queue per dst (order matters: blocks must arrive in order
         # to avoid D-side reads of uninitialised GPU memory).
         self.deferred: dict[str, deque] = defaultdict(deque)
-        # op_id -> [total_chunks, done_chunks, dst, bytes_done]
-        self._op_tracker: dict[str, list] = {}
+        self._op_tracker: dict[str, _OpState] = {}
 
     def transfer(self, req: TransferReq) -> None:
         """Trigger KV transfer for one sequence after prefill completes."""
@@ -106,7 +114,7 @@ class KVBlockPusher:
             self.transport.ack(req.op_id, dst, bytes_sent=0)
             return
         chunks = self._coalesce(delta, req.seq_id, req.op_id)
-        self._op_tracker[req.op_id] = [len(chunks), 0, dst, 0]
+        self._op_tracker[req.op_id] = _OpState(len(chunks), 0, dst, 0)
         for c in chunks:
             self.deferred[dst].append((dst, c))
         self._flush_deferred(dst)
@@ -144,11 +152,12 @@ class KVBlockPusher:
         for chunk in chunks:
             op = chunk.op_id
             if op in self._op_tracker:
-                t = self._op_tracker[op]
-                t[1] += 1; t[3] += chunk.size_bytes
-                if t[1] == t[0]:
+                s = self._op_tracker[op]
+                s.done_chunks += 1
+                s.bytes_done  += chunk.size_bytes
+                if s.done_chunks == s.total_chunks:
                     del self._op_tracker[op]
-                    self.transport.ack(op, t[2], t[3])
+                    self.transport.ack(op, s.dst, s.bytes_done)
         self._flush_deferred(dst)
 
     def _coalesce(self, block_ids: list[int], seq_id: str, op_id: str) -> list[ChunkedBlock]:
@@ -229,7 +238,6 @@ class NCCLTransport:
 
     def send_batch_async(self, dst: str, chunks: list[ChunkedBlock],
                          on_complete: Callable[[], None]) -> None:
-        # Week 8: sequential fallback. Week 9+: dist.batch_isend_irecv.
         for i, chunk in enumerate(chunks):
             cb = on_complete if i == len(chunks) - 1 else (lambda: None)
             self.send_async(dst, chunk, on_complete=cb)
@@ -263,7 +271,7 @@ class CUDAIPCTransport:
             self.send_async(dst, chunk, on_complete=cb)
 
     def ack(self, op_id: str, dst: str, bytes_sent: int) -> None:
-        pass
+        pass  # P-side block release only; no RPC to serve
 
 
 class _null_ctx:

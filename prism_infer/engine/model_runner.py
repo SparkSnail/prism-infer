@@ -34,6 +34,9 @@ class ModelRunner:
         self.warmup_model()
         self.allocate_kv_cache()
         # Compute once so run_model and capture_cudagraph use the same threshold.
+        # 512: upper bound on CUDA graph batch sizes. Beyond ~512 decode
+        # sequences the GPU is compute-bound regardless of graph overhead,
+        # and graph pool memory grows linearly with the bucket count.
         self.max_graph_bs = min(self.config.max_num_seqs, 512)
         if not self.enforce_eager:
             self.capture_cudagraph()
@@ -42,6 +45,9 @@ class ModelRunner:
 
         if self.world_size > 1:
             if rank == 0:
+                # 1 MiB: empirical ceiling for a pickled batch of sequences
+                # (each Sequence.__getstate__ sends one int token, so
+                # 512 seqs x ~2 KB overhead << 1 MiB with margin).
                 self.shm = SharedMemory(name=config.shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
@@ -239,6 +245,9 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        # Power-of-two buckets for small batches (1-8) catch the common
+        # case of low-concurrency decode with minimal wasted padding.
+        # Stride-16 beyond that amortises graph memory across nearby sizes.
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None

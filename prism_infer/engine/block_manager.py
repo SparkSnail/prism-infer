@@ -2,7 +2,16 @@ from collections import deque, OrderedDict
 import xxhash
 import numpy as np
 
+from dataclasses import dataclass
+
 from prism_infer.engine.sequence import Sequence
+
+
+@dataclass(slots=True)
+class _CPUEntry:
+    slot:      int        # index into KVOffloader.cpu_pool
+    token_ids: list[int]  # used to verify on recall
+
 
 
 class Block:
@@ -34,7 +43,7 @@ class BlockManager:
         self.evictable: OrderedDict[int, None] = OrderedDict()
         self.evict_count = 0
         self.offloader = None
-        self.gpu_to_cpu: dict[int, tuple[int, list[int]]] = {}
+        self.gpu_to_cpu: dict[int, _CPUEntry] = {}
         self.recall_hit = 0
         self.recall_miss = 0
 
@@ -47,16 +56,14 @@ class BlockManager:
         return h.intdigest()
     
     def _num_available(self) -> int:
-        # Evictable blocks can be reclaimed, so we can use them to satisfy the allocation request.
         return len(self.free_block_ids) + len(self.evictable)
     
     def _evict_one(self) -> int:
-        # Evict the least recently used block and return its block_id.
         block_id, _ = self.evictable.popitem(last=False)
         block = self.blocks[block_id]
         if (self.offloader is not None and block.hash != -1 and block.hash not in self.gpu_to_cpu and self.offloader.has_room()):
             slot = self.offloader.copy_gpu_to_cpu(block_id)
-            self.gpu_to_cpu[block.hash] = (slot, block.token_ids)
+            self.gpu_to_cpu[block.hash] = _CPUEntry(slot, block.token_ids)
 
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
@@ -64,18 +71,15 @@ class BlockManager:
         return block_id
     
     def _cpu_has(self, chain_hash: int, token_ids: list[int]) -> bool:
-        # Check if the block with the given hash and token_ids is in the CPU offload pool.
         if self.offloader is None:
             return False
         entry = self.gpu_to_cpu.get(chain_hash)
-        return entry is not None and entry[1] == token_ids
+        return entry is not None and entry.token_ids == token_ids
     
     def _recall_from_cpu(self, chain_hash: int, token_ids: list[int]) -> int:
-        # Recall the block with the given hash and token_ids from the CPU offload pool to GPU.
         assert self.offloader is not None
-        slot, _ = self.gpu_to_cpu.pop(chain_hash)
+        slot = self.gpu_to_cpu.pop(chain_hash).slot
         block_id = self._allocate_block()
-        # Copy the block from CPU to GPU and update the block's hash and token_ids.
         self.offloader.copy_cpu_to_gpu(slot, block_id)
         block = self.blocks[block_id]
         block.update(chain_hash, token_ids)
@@ -84,8 +88,6 @@ class BlockManager:
         return block_id
 
     def _allocate_block(self) -> int:
-        # Allocate a block and return its block_id. 
-        # If no free blocks are available, evict one.
         if self.free_block_ids:
             block_id = self.free_block_ids.popleft()
         else:
@@ -99,8 +101,6 @@ class BlockManager:
     def _deallocate_block(self, block_id: int):
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
-        # If the block hash is valid, it can be put into the evictable list for future reuse.
-        # Otherwise, it is simply added to the free list.
         if self.blocks[block_id].hash != -1:
             self.evictable[block_id] = None
         else:
@@ -110,7 +110,6 @@ class BlockManager:
         h = -1
         num_cached_blocks = 0
         num_new_blocks = seq.num_blocks
-        # Check the longest prefix of blocks that can be reused, and count how many new blocks are needed after that.
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
@@ -131,12 +130,10 @@ class BlockManager:
         assert not seq.block_table
         h = -1
         hashes = []
-        # phase 1: calculate the hash for sequence cached blocks
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             hashes.append((h, token_ids))
-        # phase 2: pin all GPU reserved blocks
         recall_idx = []
         for i, (h, token_ids) in enumerate(hashes):
             block_id = self.hash_to_block_id.get(h, -1)
@@ -150,15 +147,12 @@ class BlockManager:
                     self.used_block_ids.add(block_id)
                 seq.block_table.append(block_id)
             else:
-                # pin placeholder for CPU offloaded block, will recall in phase 3
                 seq.block_table.append(-1)
                 recall_idx.append(i)
-        # phase 3: recall cpu offloaded blocks
         for i in recall_idx:
             h, token_ids = hashes[i]
             block_id = self._recall_from_cpu(h, token_ids)
             seq.block_table[i] = block_id
-        # phase 4: allocate new blocks for the remaining sequence blocks
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size

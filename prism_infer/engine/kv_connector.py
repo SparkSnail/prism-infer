@@ -35,7 +35,7 @@ class PrefillConnector:
             src_instance=self.config.instance_id or "prefill-0",
             dst_instance=self.config.pd_decode_addr,
             block_table=seq.block_table[:],
-            block_hint=[],  # populated by serve in Week 10; send full KV for now
+            block_hint=[],  # no hint yet: send full KV (serve will populate on S1/KV-affinity route)
             on_fail=getattr(self.config, "kv_transfer_on_fail", "recompute"),
         )
         self.pusher.transfer(req)
