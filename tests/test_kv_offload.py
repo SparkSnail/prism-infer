@@ -49,7 +49,7 @@ def test_evict_offloads_not_drops():
     assert evicted == ids[0]
     assert bm.offloader.gpu_to_cpu_calls == 1  # offloaded, not dropped
     assert 1000 in bm.gpu_to_cpu               # indexed by its chain hash
-    assert bm.gpu_to_cpu[1000][1] == [0]       # token_ids stored for validation/restore
+    assert bm.gpu_to_cpu[1000].token_ids == [0]  # token_ids stored for validation/restore
     assert 1000 not in bm.hash_to_block_id     # GPU index cleared
 
 
