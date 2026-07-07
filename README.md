@@ -25,9 +25,13 @@ It started as a fork of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)
 - [x] **PagedAttention**: fixed-size KV blocks, prefix caching via rolling hash
 - [x] **Two-phase scheduling**: prefill + decode continuous batching with preemption
 - [x] **Tensor parallelism**: column/row-parallel linear, fused QKV / gate-up projections
+- [x] **Expert parallelism**: all-to-all dispatch/combine for MoE across multiple GPUs
 - [x] **CUDA graph**: capture for decode, Torch compilation for fused ops
+- [x] **KV cache LRU + CPU offload**: access-order eviction, pinned CPU pool, recall on prefix hit
 - [x] **Qwen3 Dense** forward: GQA + QK-norm + RoPE (θ=1e6)
-- [x] **Qwen3-MoE** forward: router top-k of N + SwiGLU experts with re-norm, expert parallel
+- [x] **Qwen3-MoE** forward: router top-k of N + SwiGLU experts with re-norm
+- [x] **PD disaggregation**: prefill-only / decode-only engine modes, KV transfer via NCCL P2P
+- [x] **KV snapshot & live migration**: aligned/unaligned/incremental snapshots, three-way handshake, watchdog
 
 ## Installation
 
@@ -92,6 +96,51 @@ PRISM_MODEL=~/models/Qwen3-0.6B python example.py
 
 `example.py` read the model directory from the `PRISM_MODEL` env var (a local model folder; defaults to `~/models/Qwen3-0.6B/`).
 
+## PD Disaggregation
+
+prism-infer supports **prefill-decode disaggregation**: the prefill and decode phases run in separate processes, with KV cache transferred between them via NCCL P2P.
+
+### Single-node (two GPUs)
+
+```bash
+# Terminal 1: prefill process (GPU 0)
+CUDA_VISIBLE_DEVICES=0 python -m prism_infer.engine.pd_runner \
+    --mode prefill-only --model ~/models/Qwen3-0.6B \
+    --master-addr localhost --master-port 29500 \
+    --world-size 2 --rank 0
+
+# Terminal 2: decode process (GPU 1)
+CUDA_VISIBLE_DEVICES=1 python -m prism_infer.engine.pd_runner \
+    --mode decode-only --model ~/models/Qwen3-0.6B \
+    --master-addr localhost --master-port 29500 \
+    --world-size 2 --rank 1
+```
+
+### Multi-node
+
+```bash
+# Node A (rank 0, prefill)
+NCCL_SOCKET_IFNAME=eth0 python -m prism_infer.engine.pd_runner \
+    --mode prefill-only --model /shared/Qwen3-0.6B \
+    --master-addr <node-A-ip> --master-port 29500 \
+    --world-size 2 --rank 0
+
+# Node B (rank 1, decode)
+NCCL_SOCKET_IFNAME=eth0 python -m prism_infer.engine.pd_runner \
+    --mode decode-only --model /shared/Qwen3-0.6B \
+    --master-addr <node-A-ip> --master-port 29500 \
+    --world-size 2 --rank 1
+```
+
+### Unified baseline (parity check)
+
+```bash
+python -m prism_infer.engine.pd_runner \
+    --mode unified --model ~/models/Qwen3-0.6B
+```
+
+Greedy output (`temperature=0`) from PD mode matches unified mode token-for-token.
+
 ## Testing
 
 **Unit tests run on CPU.**
@@ -100,6 +149,10 @@ PRISM_MODEL=~/models/Qwen3-0.6B python example.py
 pip install -e ".[test]"
 python -m pytest tests/ -q
 ```
+
+The CPU suite covers scheduling, block management, KV transfer, KV snapshot/migration,
+PD connector logic, distributed context, and tensor/expert parallel math.
+Currently: 122 passed, 4 skipped.
 
 **E2E Parity Tests**
 

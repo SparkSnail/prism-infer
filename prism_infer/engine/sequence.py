@@ -11,7 +11,15 @@ class SequenceStatus(Enum):
     # waiting for remote KV transfer to complete before scheduling decode.
     KV_TRANSFERRING = auto()
     RUNNING = auto()
+    # Live migration: src is sending KV to dst; seq stays in src
+    # running queue until transfer completes or aborts.
+    MIGRATING_OUT = auto()
+    # Live migration: dst is receiving KV; blocks pre-allocated but
+    # empty until NCCLTransport.recv_kv() writes data.
+    MIGRATING_IN = auto()
     FINISHED = auto()
+    # Transfer or migration exhausted retries; serve returns error to client.
+    ABORTED = auto()
 
 
 class Sequence:

@@ -1,4 +1,5 @@
 import atexit
+import asyncio
 import os
 import socket
 import uuid
@@ -25,10 +26,18 @@ def _find_free_port() -> int:
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
-        config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
+        # model may be a path string or a pre-built Config object.
+        # pd_runner and test_parity_pd pass a Config directly so the process group
+        # they created before calling LLMEngine is preserved.
+        if isinstance(model, Config):
+            config = model
+        else:
+            config_fields = {field.name for field in fields(Config)}
+            config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
+            config = Config(model, **config_kwargs)
+
         Sequence.block_size = config.kvcache_block_size
+
         # Generate a unique NCCL port + shm name once, before spawning workers,
         # so rank 0 and all workers (which receive Config via pickle) agree.
         # The port is always needed: even TP=1 calls init_process_group(world_size=1),
@@ -36,21 +45,31 @@ class LLMEngine:
         # used for TP>1 worker communication.
         if config.master_port == 0:
             config.master_port = _find_free_port()
-        if config.tensor_parallel_size > 1 and not config.shm_name:
-            config.shm_name = f"prism_infer_{os.getpid()}_{uuid.uuid4().hex[:8]}"
-        self.ps = []
-        self.events = []
-        ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+
+        if not config._use_shm_worker_loop:
+            # EP standalone mode: launched by torchrun; all ranks are peers, no spawn.
+            ep_rank = int(os.environ.get("RANK", "0"))
+            self.ps = []
+            self.events = []
+            self.model_runner = ModelRunner(config, ep_rank, [])
+        else:
+            if config.world_size > 1 and not config.shm_name:
+                config.shm_name = f"prism_infer_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+            self.ps = []
+            self.events = []
+            ctx = mp.get_context("spawn")
+            for i in range(1, config.world_size):
+                event = ctx.Event()
+                process = ctx.Process(target=ModelRunner, args=(config, i, event))
+                process.start()
+                self.ps.append(process)
+                self.events.append(event)
+            self.model_runner = ModelRunner(config, 0, self.events)
+
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+
         # CPU offload is only safe on single-GPU (TP=1, EP=1): multi-GPU EP has no
         # mechanism to synchronise per-rank offload state across ranks.
         if (config.cpu_offload_blocks > 0
@@ -59,20 +78,29 @@ class LLMEngine:
             from prism_infer.engine.kv_offloader import KVOffloader
             self.scheduler.block_manager.offloader = KVOffloader(
                 self.model_runner.kv_cache, config.cpu_offload_blocks)
-        atexit.register(self.exit)
+
+        atexit.register(self._ep_exit if not config._use_shm_worker_loop else self.exit)
+
         # KVConnector: single choke-point for PD-role behaviour.
-        # unified: no-op;
-        # prefill-only: fires KVBlockPusher;
-        # decode-only: polls KVReceiver.
+        # unified: no-op; prefill-only: fires KVBlockPusher; decode-only: polls KVReceiver.
         from prism_infer.engine.kv_connector import _build_connector
         kv_cache = getattr(self.model_runner, "kv_cache", None)
         self.kv_connector = _build_connector(config, kv_cache=kv_cache)
+        self.scheduler._kv_ready_fn = self.kv_connector.on_before_decode
+
+        from prism_infer.engine.kv_snapshot import MigrationWatchdog
+        self._migration_watchdog = MigrationWatchdog(self.scheduler.block_manager)
+        self._watchdog_started = False
 
     def exit(self):
         self.model_runner.call("exit")
         del self.model_runner
         for p in self.ps:
             p.join()
+
+    def _ep_exit(self):
+        self.model_runner.exit()
+        del self.model_runner
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
@@ -86,15 +114,36 @@ class LLMEngine:
         # skip the model call and return empty for this step.
         if not seqs:
             return [], 0
+
+        # Positive = prefill token count; negative = decode batch size.
+        # Callers use the sign to distinguish the two phases.
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+
+        token_ids = (
+            self.model_runner.run(seqs, is_prefill)
+            if not self.model_runner.config._use_shm_worker_loop
+            else self.model_runner.call("run", seqs, is_prefill)
+        )
+        # EP standalone: run() returns None on rank > 0; skip scheduler update.
+        if token_ids is None:
+            return [], num_tokens
+
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+
         outputs = []
         for seq in seqs:
-            if is_prefill and seq.num_cached_tokens == seq.num_tokens:
+            if is_prefill and seq.num_cached_tokens == seq.num_prompt_tokens:
                 self.kv_connector.on_prefill_done(seq)
             if seq.is_finished:
                 outputs.append((seq.seq_id, seq.completion_token_ids))
+
+        if hasattr(self.kv_connector, 'transport') and hasattr(
+                self.kv_connector.transport, 'poll_completions'):
+            self.kv_connector.transport.poll_completions()
+
+        if hasattr(self.kv_connector, 'poll_recv'):
+            self.kv_connector.poll_recv()
+
         return outputs, num_tokens
 
     def is_finished(self):
@@ -111,11 +160,12 @@ class LLMEngine:
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
+
         by_seq_id: dict[int, list[int]] = {}
         prefill_throughput = decode_throughput = 0.
         while not self.is_finished():
             t = perf_counter()
-            finished, num_tokens = self.step()
+            output, num_tokens = self.step()
             if num_tokens > 0:
                 prefill_throughput = num_tokens / (perf_counter() - t)
             else:
@@ -124,9 +174,113 @@ class LLMEngine:
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in finished:
+            for seq_id, token_ids in output:
                 by_seq_id[seq_id] = token_ids
                 pbar.update(1)
         pbar.close()
-        token_ids_list = [by_seq_id[seq_id] for seq_id in sorted(by_seq_id)]
-        return [{"text": self.tokenizer.decode(ids), "token_ids": ids} for ids in token_ids_list]
+
+        outputs = [by_seq_id[seq_id] for seq_id in sorted(by_seq_id)]
+        return [{"text": self.tokenizer.decode(ids), "token_ids": ids} for ids in outputs]
+
+    # -------------------------------------------------------------------------
+    # Migration RPC entry points (three-way handshake, infer side)
+    # -------------------------------------------------------------------------
+
+    def handle_migrate_req(self, req) -> dict:
+        """Snapshot a sequence for migration (handshake Step 1).
+
+        serve flow:
+          Step 1: src.handle_migrate_req(req)         -> SnapHandle
+          Step 2: dst.pre_alloc_blocks_for_migration  -> dst_block_ids
+          Step 3: src transfers KV; dst.commit_migration_for_seq
+
+        Returns {"success": True, "handle": SnapHandle} or {"success": False, "error": str}.
+        """
+        from prism_infer.engine.kv_snapshot import (
+            snapshot_sequence, incremental_snapshot,
+        )
+        from prism_infer.engine.sequence import SequenceStatus
+
+        if not self._watchdog_started:
+            try:
+                loop = asyncio.get_event_loop()
+                loop.create_task(self._migration_watchdog.watch_loop())
+                self._watchdog_started = True
+            except RuntimeError:
+                pass  # no running event loop in sync context
+
+        seq_id = int(req.seq_id)
+        seq = None
+        for s in list(self.scheduler.running) + list(self.scheduler.waiting):
+            if s.seq_id == seq_id:
+                seq = s
+                break
+        if seq is None:
+            return {"success": False, "error": f"seq_id={seq_id} not found"}
+        if seq.is_finished:
+            return {"success": False, "error": f"seq_id={seq_id} already finished (ABORTED_SRC)"}
+
+        seq.status = SequenceStatus.MIGRATING_OUT
+        try:
+            allow_unaligned = (req.mode == "unaligned")
+            if req.incremental and req.base_blocks:
+                handle = incremental_snapshot(seq, req.base_blocks)
+            else:
+                handle = snapshot_sequence(seq, allow_unaligned=allow_unaligned)
+            return {"success": True, "handle": handle}
+        except Exception as e:
+            seq.status = SequenceStatus.RUNNING
+            return {"success": False, "error": str(e)}
+
+    def pre_alloc_blocks_for_migration(
+        self,
+        seq_id: str,
+        block_num: int,
+        token_ids: list,
+    ) -> dict:
+        """Pre-allocate dst block slots (handshake Step 2).
+
+        Returns {"success": True, "dst_blocks": [...]} or {"success": False, "error": str}.
+        """
+        from prism_infer.engine.kv_snapshot import pre_alloc_blocks
+        dst_blocks = pre_alloc_blocks(
+            seq_id, block_num, token_ids,
+            self.scheduler.block_manager,
+        )
+        if dst_blocks is None:
+            return {"success": False, "error": "dst OOM (ABORTED_DST)"}
+        self._migration_watchdog.register(seq_id, dst_blocks)
+        return {"success": True, "dst_blocks": dst_blocks}
+
+    def commit_migration_for_seq(self, seq_id: str, handle, sampling_params) -> dict:
+        """Transition dst sequence to active after KV transfer completes (handshake Step 3b).
+
+        Returns {"success": True} or {"success": False, "error": str}.
+        """
+        from prism_infer.engine.kv_snapshot import apply_snapshot, commit_migration
+        from prism_infer.engine.sequence import SequenceStatus
+
+        try:
+            seq = apply_snapshot(handle, self.scheduler.block_manager, sampling_params)
+            commit_migration(seq_id, handle, seq)
+            self._migration_watchdog.commit(seq_id)
+            if seq.status == SequenceStatus.RUNNING:
+                self.scheduler.running.append(seq)
+            else:
+                self.scheduler.waiting.append(seq)
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def reset_to_waiting_for_seq(self, seq_id: str) -> dict:
+        """Revert a KV_TRANSFERRING sequence to WAITING for recompute fallback.
+
+        Called by serve when KV transfer times out and on_fail="recompute".
+        """
+        from prism_infer.engine.kv_snapshot import reset_to_waiting
+        seq_id_int = int(seq_id)
+        for s in list(self.scheduler.running) + list(self.scheduler.waiting):
+            if s.seq_id == seq_id_int:
+                reset_to_waiting(s)
+                return {"success": True}
+        return {"success": False, "error": f"seq_id={seq_id} not found"}

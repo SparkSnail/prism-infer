@@ -6,7 +6,9 @@ from multiprocessing.shared_memory import SharedMemory
 
 from prism_infer.config import Config
 from prism_infer.engine.sequence import Sequence
+from prism_infer.engine.parallel.expert_parallel import set_expert_parallel_size
 from prism_infer.models.qwen3 import Qwen3ForCausalLM
+from prism_infer.layers.linear import set_tp_group
 from prism_infer.layers.sampler import Sampler
 from prism_infer.utils.context import set_context, get_context, reset_context
 from prism_infer.utils.loader import load_model
@@ -19,35 +21,53 @@ class ModelRunner:
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
-        self.world_size = config.tensor_parallel_size
+        self.world_size = config.world_size  # max(tp_size, ep_size); TP and EP are mutually exclusive
         self.rank = rank
         self.event = event
 
-        dist.init_process_group("nccl", f"tcp://localhost:{config.master_port}", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        # torchrun (EP standalone) already initializes the default PG before user code.
+        # Only call init_process_group if not yet initialized (TP mp.spawn / PD standalone).
+        if not dist.is_initialized():
+            # PD standalone: each process runs a private world_size=1 group.
+            # Override self.rank/world_size so sampler, TP sharding, and broadcast
+            # all treat this process as rank 0. (rank param carries the GPU id.)
+            self.rank = 0
+            self.world_size = 1
+            dist.init_process_group("nccl", f"tcp://localhost:{config.master_port}", world_size=1, rank=0)
+        torch.cuda.set_device(rank % torch.cuda.device_count())
+
+        # Build TP process group only for pure-TP configs.
+        # Pure EP: leave TP group unset so _tp_rank()/_tp_size() return 0/1 and
+        # TP-aware linears don't shard (EP all-to-all uses the default group).
+        tp_size = config.tensor_parallel_size
+        if tp_size > 1:
+            tp_group = dist.new_group(ranks=list(range(tp_size)))
+            set_tp_group(tp_group)
+
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
+
+        if config.expert_parallel_size > 1:
+            set_expert_parallel_size(config.expert_parallel_size)
+
         self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        # Compute once so run_model and capture_cudagraph use the same threshold.
-        # 512: upper bound on CUDA graph batch sizes. Beyond ~512 decode
-        # sequences the GPU is compute-bound regardless of graph overhead,
-        # and graph pool memory grows linearly with the bucket count.
+        # 512: upper bound on CUDA graph batch sizes. Beyond ~512 decode sequences
+        # the GPU is compute-bound regardless of graph overhead, and graph pool
+        # memory grows linearly with the bucket count.
         self.max_graph_bs = min(self.config.max_num_seqs, 512)
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        if self.world_size > 1:
+        if self.world_size > 1 and config._use_shm_worker_loop:
             if rank == 0:
                 # 1 MiB: empirical ceiling for a pickled batch of sequences
-                # (each Sequence.__getstate__ sends one int token, so
-                # 512 seqs x ~2 KB overhead << 1 MiB with margin).
                 self.shm = SharedMemory(name=config.shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
@@ -56,7 +76,7 @@ class ModelRunner:
                 self.loop()
 
     def exit(self):
-        if self.world_size > 1:
+        if self.world_size > 1 and self.config._use_shm_worker_loop:
             self.shm.close()
             dist.barrier()
             if self.rank == 0:
@@ -64,7 +84,8 @@ class ModelRunner:
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
     def loop(self):
         while True:
@@ -91,7 +112,7 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:
+        if self.world_size > 1 and self.rank == 0 and self.config._use_shm_worker_loop:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)
@@ -231,6 +252,19 @@ class ModelRunner:
         logits = self.run_model(input_ids, positions, is_prefill)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
+
+        # EP standalone: rank 0 broadcasts token_ids to all ranks so every rank
+        # can call postprocess and keep scheduler state in sync.
+        # TP workers never reach this point (they live in the shm loop).
+        if not self.config._use_shm_worker_loop and self.world_size > 1:
+            if self.rank == 0:
+                t = torch.tensor(token_ids, dtype=torch.int64, device="cuda")
+            else:
+                t = torch.empty(len(seqs), dtype=torch.int64, device="cuda")
+            dist.broadcast(t, src=0)
+            if self.rank != 0:
+                token_ids = t.tolist()
+
         return token_ids
 
     @torch.inference_mode()
