@@ -234,6 +234,9 @@ class NCCLTransport:
     instead of N separate isend calls. Each isend call carries ~5-50us Python->NCCL->CUDA
     overhead; batching amortises that to a single fixed cost regardless of N.
 
+    The send side issues one P2POp per block (via _block_slices) to match the
+    per-block irecv ops issued by recv_kv on the destination.
+
     recv_kv receives KV from the P side into pre-allocated local blocks (handshake Step 3).
     Receives into a temporary contiguous buffer then copy_ into kv_cache, because
     kv_cache[:, :, block_id] is non-contiguous and NCCL requires contiguous tensors.
@@ -276,16 +279,25 @@ class NCCLTransport:
             ops    = []
             slices = []
             for chunk in chunks:
-                first, last = chunk.block_ids[0], chunk.block_ids[-1]
-                kv_slice = self.kv_cache[:, :, first:last + 1, :, :, :].contiguous()
-                slices.append(kv_slice)
-                ops.append(dist.P2POp(
-                    dist.isend, kv_slice,
-                    peer=self.decode_rank,
-                    group=self.pd_group,
-                ))
+                # Send one message per block so the count and shape match the
+                # per-block irecv ops issued by recv_kv on the destination.
+                # All ops are submitted in a single batch_isend_irecv call.
+                for kv_slice in self._block_slices(chunk.block_ids):
+                    slices.append(kv_slice)
+                    ops.append(dist.P2POp(
+                        dist.isend, kv_slice,
+                        peer=self.decode_rank,
+                        group=self.pd_group,
+                    ))
             reqs = dist.batch_isend_irecv(ops)
             self._pending.append((reqs, chunks, slices, on_complete))
+
+    def _block_slices(self, block_ids: list[int]) -> list[torch.Tensor]:
+        """One contiguous tensor per block, matching the recv_kv irecv shape."""
+        return [
+            self.kv_cache[:, :, block_id, :, :, :].contiguous()
+            for block_id in block_ids
+        ]
 
     def recv_kv(self, src_rank: int, block_ids: list[int]) -> None:
         """Receive KV from src_rank into kv_cache block slots (handshake Step 3).

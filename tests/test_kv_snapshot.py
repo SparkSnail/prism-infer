@@ -1,6 +1,7 @@
 import time
 import pytest
 
+from prism_infer.engine.block_manager import BlockManager
 from prism_infer.engine.sequence import Sequence, SequenceStatus
 from prism_infer.engine.kv_snapshot import (
     SnapHandle,
@@ -33,7 +34,7 @@ def _make_seq(num_tokens: int = 8, num_cached: int = 8,
 
 
 class _MockBlockManager:
-    """Minimal BlockManager mock: supports _allocate_block / _free_block only."""
+    """Minimal BlockManager mock with the same public surface as the real one."""
     def __init__(self, total_blocks: int = 64):
         self._free = list(range(total_blocks))
         self.freed = []
@@ -41,7 +42,7 @@ class _MockBlockManager:
     def _allocate_block(self):
         return self._free.pop(0) if self._free else None
 
-    def _free_block(self, block_id: int):
+    def release_block(self, block_id: int):
         self._free.append(block_id)
         self.freed.append(block_id)
 
@@ -148,6 +149,40 @@ def test_apply_snapshot_unaligned():
     assert seq.num_cached_tokens == 4
 
 
+def test_apply_snapshot_reuses_preallocated_blocks():
+    """commit_migration must reuse the blocks allocated in Step 2 (not re-allocate)."""
+    sp = SamplingParams()
+    handle = SnapHandle(
+        seq_id="42",
+        block_table=[10, 11],
+        token_ids=list(range(8)),
+        num_cached_tokens=8,
+    )
+    bm = BlockManager(num_blocks=4, block_size=4)
+    dst_blocks = pre_alloc_blocks("42", 2, handle.token_ids, bm)
+    assert dst_blocks is not None
+
+    seq = apply_snapshot(handle, bm, sp, dst_blocks=dst_blocks)
+
+    assert seq.block_table == dst_blocks
+    assert len(bm.used_block_ids) == 2
+    assert len(bm.free_block_ids) == 2
+
+
+def test_apply_snapshot_rejects_wrong_block_count():
+    """Wrong number of pre-allocated blocks must raise AssertionError."""
+    handle = SnapHandle(
+        seq_id="42",
+        block_table=[10, 11],
+        token_ids=list(range(8)),
+        num_cached_tokens=8,
+    )
+    bm = _MockBlockManager(total_blocks=4)
+
+    with pytest.raises(AssertionError, match="block count mismatch"):
+        apply_snapshot(handle, bm, SamplingParams(), dst_blocks=[0])
+
+
 def test_apply_snapshot_oom():
     sp = SamplingParams()
     handle = SnapHandle(
@@ -159,6 +194,28 @@ def test_apply_snapshot_oom():
     bm = _MockBlockManager(total_blocks=2)
     with pytest.raises(AssertionError, match="OOM"):
         apply_snapshot(handle, bm, sp)
+
+
+def test_pre_alloc_blocks_real_manager_oom_rollback():
+    """Exhausting the real BlockManager must roll back without leaking blocks."""
+    bm = BlockManager(num_blocks=2, block_size=4)
+
+    result = pre_alloc_blocks("seq_oom", 3, list(range(8)), bm)
+
+    assert result is None
+    assert len(bm.free_block_ids) == 2
+    assert not bm.used_block_ids
+
+
+def test_free_pre_alloc_real_manager():
+    """free_pre_alloc on a real BlockManager returns the block to the free pool."""
+    bm = BlockManager(num_blocks=2, block_size=4)
+    block_id = bm._allocate_block()
+
+    free_pre_alloc([block_id], bm)
+
+    assert len(bm.free_block_ids) == 2
+    assert not bm.used_block_ids
 
 
 def test_watchdog_timeout_releases_blocks():
@@ -186,6 +243,16 @@ def test_watchdog_commit_removes_from_pending():
     watchdog.register("seq_2", [5, 6])
     watchdog.commit("seq_2")
     assert "seq_2" not in watchdog._pending
+
+
+def test_watchdog_pending_blocks_returns_correct_ids():
+    """pending_blocks() returns the registered block list before commit."""
+    bm = _MockBlockManager()
+    watchdog = MigrationWatchdog(bm)
+    watchdog.register("seq_3", [10, 11, 12])
+    assert watchdog.pending_blocks("seq_3") == [10, 11, 12]
+    watchdog.commit("seq_3")
+    assert watchdog.pending_blocks("seq_3") is None
 
 
 def test_free_pre_alloc_releases_blocks():

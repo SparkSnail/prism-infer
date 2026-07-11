@@ -255,13 +255,25 @@ class LLMEngine:
     def commit_migration_for_seq(self, seq_id: str, handle, sampling_params) -> dict:
         """Transition dst sequence to active after KV transfer completes (handshake Step 3b).
 
+        Uses blocks pre-allocated in Step 2 (already contain the transferred KV data).
         Returns {"success": True} or {"success": False, "error": str}.
         """
         from prism_infer.engine.kv_snapshot import apply_snapshot, commit_migration
         from prism_infer.engine.sequence import SequenceStatus
 
         try:
-            seq = apply_snapshot(handle, self.scheduler.block_manager, sampling_params)
+            dst_blocks = self._migration_watchdog.pending_blocks(seq_id)
+            if dst_blocks is None:
+                return {
+                    "success": False,
+                    "error": f"seq_id={seq_id} has no pre-allocated blocks (Step 2 missing or timed out)",
+                }
+            seq = apply_snapshot(
+                handle,
+                self.scheduler.block_manager,
+                sampling_params,
+                dst_blocks=dst_blocks,
+            )
             commit_migration(seq_id, handle, seq)
             self._migration_watchdog.commit(seq_id)
             if seq.status == SequenceStatus.RUNNING:

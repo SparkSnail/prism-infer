@@ -96,8 +96,7 @@ def incremental_snapshot(
     Must be called in aligned state (num_scheduled_tokens == 0); delta over a
     half-written block corrupts the destination.
 
-    Useful for periodic KV replication (serve S7 ISR) where full retransfer
-    would waste bandwidth.
+    Useful for periodic KV replication where full retransfer would waste bandwidth.
     """
     assert seq.num_scheduled_tokens == 0, (
         "incremental_snapshot requires aligned state (num_scheduled_tokens==0)"
@@ -115,15 +114,42 @@ def incremental_snapshot(
     )
 
 
+def _try_allocate_blocks(
+    block_num: int,
+    block_manager: "BlockManager",
+) -> Optional[List[int]]:
+    """Transactional pre-allocation: roll back all allocations on any failure."""
+    allocated: List[int] = []
+    try:
+        for _ in range(block_num):
+            block_id = block_manager._allocate_block()
+            if block_id is None:
+                raise IndexError("block pool exhausted")
+            allocated.append(block_id)
+    except (KeyError, IndexError):
+        for block_id in allocated:
+            block_manager.release_block(block_id)
+        return None
+    return allocated
+
+
 def apply_snapshot(
     handle: SnapHandle,
     block_manager: "BlockManager",
     sampling_params: "SamplingParams",
+    dst_blocks: Optional[List[int]] = None,
 ) -> "Sequence":
     """Reconstruct a sequence on the destination from a SnapHandle (handshake Step 2).
 
     Allocates block slots only -- no KV data is written here.
     KV data is written by NCCLTransport.recv_kv() in Step 3.
+
+    Args:
+        handle:          SnapHandle from the source instance
+        block_manager:   dst BlockManager
+        sampling_params: needed to reconstruct Sequence
+        dst_blocks:      pre-allocated block ids from pre_alloc_blocks (Step 2);
+                         if None, allocates fresh blocks (standalone recovery path)
 
     Returns:
         Sequence with status KV_TRANSFERRING (aligned) or WAITING (unaligned)
@@ -142,12 +168,16 @@ def apply_snapshot(
         seq.status = SequenceStatus.KV_TRANSFERRING
 
     num_blocks = len(handle.block_table)
-    for _ in range(num_blocks):
-        block_id = block_manager._allocate_block()
-        assert block_id is not None, (
+    if dst_blocks is None:
+        # Standalone recovery: allocate fresh blocks
+        dst_blocks = _try_allocate_blocks(num_blocks, block_manager)
+        assert dst_blocks is not None, (
             f"dst OOM: cannot allocate {num_blocks} blocks for seq {handle.seq_id}"
         )
-        seq.block_table.append(block_id)
+    assert len(dst_blocks) == num_blocks, (
+        f"dst block count mismatch: expected {num_blocks}, got {len(dst_blocks)}"
+    )
+    seq.block_table.extend(dst_blocks)
 
     return seq
 
@@ -163,15 +193,7 @@ def pre_alloc_blocks(
     Returns dst_block_ids on success, None if OOM.
     On None, serve triggers ABORTED_DST and src keeps the sequence.
     """
-    dst_blocks: List[int] = []
-    for _ in range(block_num):
-        bid = block_manager._allocate_block()
-        if bid is None:
-            for b in dst_blocks:
-                block_manager._free_block(b)
-            return None
-        dst_blocks.append(bid)
-    return dst_blocks
+    return _try_allocate_blocks(block_num, block_manager)
 
 
 def commit_migration(
@@ -198,7 +220,7 @@ def free_pre_alloc(
 ) -> None:
     """Release dst pre-allocated blocks on ABORTED_DST or ABORTED_SRC."""
     for b in block_ids:
-        block_manager._free_block(b)
+        block_manager.release_block(b)
 
 
 def reset_to_waiting(seq: "Sequence") -> None:
@@ -246,6 +268,11 @@ class MigrationWatchdog:
 
     def commit(self, seq_id: str) -> None:
         self._pending.pop(seq_id, None)
+
+    def pending_blocks(self, seq_id: str) -> Optional[List[int]]:
+        """Return the pre-allocated block ids registered for seq_id, or None."""
+        entry = self._pending.get(seq_id)
+        return list(entry[0]) if entry is not None else None
 
     async def watch_loop(self) -> None:
         while True:

@@ -54,28 +54,28 @@ class BlockManager:
             h.update(prefix.to_bytes(8, "little"))
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
-    
+
     def _num_available(self) -> int:
         return len(self.free_block_ids) + len(self.evictable)
-    
+
     def _evict_one(self) -> int:
         block_id, _ = self.evictable.popitem(last=False)
         block = self.blocks[block_id]
-        if (self.offloader is not None and block.hash != -1 and block.hash not in self.gpu_to_cpu and self.offloader.has_room()):
+        if (self.offloader is not None and block.hash != -1
+                and block.hash not in self.gpu_to_cpu and self.offloader.has_room()):
             slot = self.offloader.copy_gpu_to_cpu(block_id)
             self.gpu_to_cpu[block.hash] = _CPUEntry(slot, block.token_ids)
-
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
             del self.hash_to_block_id[block.hash]
         self.evict_count += 1
         return block_id
-    
+
     def _cpu_has(self, chain_hash: int, token_ids: list[int]) -> bool:
         if self.offloader is None:
             return False
         entry = self.gpu_to_cpu.get(chain_hash)
         return entry is not None and entry.token_ids == token_ids
-    
+
     def _recall_from_cpu(self, chain_hash: int, token_ids: list[int]) -> int:
         assert self.offloader is not None
         slot = self.gpu_to_cpu.pop(chain_hash).slot
@@ -105,6 +105,14 @@ class BlockManager:
             self.evictable[block_id] = None
         else:
             self.free_block_ids.append(block_id)
+
+    def release_block(self, block_id: int) -> None:
+        """Decrement ref_count for a single block; return it to the pool when it reaches zero."""
+        block = self.blocks[block_id]
+        assert block.ref_count > 0, f"block {block_id} ref_count is already 0"
+        block.ref_count -= 1
+        if block.ref_count == 0:
+            self._deallocate_block(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
         h = -1

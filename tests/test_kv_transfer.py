@@ -3,7 +3,8 @@ import torch
 from collections import defaultdict
 
 from prism_infer.engine.kv_transfer import (
-    TransferReq, ChunkedBlock, KVBlockPusher, KVReceiver, _calc_block_bytes,
+    TransferReq, ChunkedBlock, KVBlockPusher, KVReceiver, NCCLTransport,
+    _calc_block_bytes,
 )
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -95,6 +96,21 @@ def test_coalesce_respects_max_bytes_inflight():
     for c in chunks:
         assert c.size_bytes <= max_inf, f"chunk {c.block_ids} exceeds limit"
     assert len(chunks) > 1
+
+
+def test_nccl_block_slices_shape_and_count():
+    """_block_slices must produce one contiguous tensor per block,
+    matching the per-block irecv ops issued by recv_kv on the destination."""
+    kv = _fake_kv()
+    transport = NCCLTransport(pd_group=None, decode_rank=1, kv_cache=kv)
+
+    slices = transport._block_slices([2, 3, 4])
+
+    assert len(slices) == 3
+    expected_shape = kv[:, :, 0, :, :, :].shape
+    for s in slices:
+        assert s.shape == expected_shape
+        assert s.is_contiguous()
 
 
 def test_flow_control_defers_overflow():

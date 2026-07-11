@@ -167,3 +167,107 @@ def test_postprocess_finishes_on_max_tokens(small_block):
     sch.postprocess(seqs, [7], is_prefill)             # 1 completion token == max_tokens
     assert a.is_finished is True
     assert a.status == SequenceStatus.FINISHED
+
+def test_kv_ready_fn_default_is_none(small_block):
+    """_kv_ready_fn defaults to None (unified mode -- no gate applied)."""
+    sch = make_scheduler()
+    assert sch._kv_ready_fn is None
+
+
+def test_kv_ready_fn_skips_transferring_seq(small_block):
+    """KV_TRANSFERRING seq is held back when kv_ready_fn returns False."""
+    sch = make_scheduler()
+
+    # Prefill 'a' to move it into running.
+    a = Sequence([1, 2, 3, 4])
+    sch.add(a)
+    seqs, is_prefill = sch.schedule()
+    sch.postprocess(seqs, [10], is_prefill)    # a: RUNNING
+
+    # Add 'b' directly to running in KV_TRANSFERRING state.
+    b = Sequence([5, 6, 7, 8])
+    sch.block_manager.allocate(b, 0)
+    b.status = SequenceStatus.KV_TRANSFERRING
+    b.num_cached_tokens = 4
+    sch.running.append(b)
+
+    # Gate: b is not ready, a is ready.
+    sch._kv_ready_fn = lambda seq: seq is not b
+
+    seqs2, is_prefill2 = sch.schedule()
+    assert is_prefill2 is False
+    assert a in seqs2          # a passes the gate
+    assert b not in seqs2      # b is held back
+    assert b in sch.running    # b remains in the running queue
+
+
+def test_kv_ready_fn_passes_when_kv_ready(small_block):
+    """KV_TRANSFERRING seq is scheduled when kv_ready_fn returns True."""
+    sch = make_scheduler()
+
+    a = Sequence([1, 2, 3, 4])
+    sch.block_manager.allocate(a, 0)
+    a.status = SequenceStatus.KV_TRANSFERRING
+    a.num_cached_tokens = 4
+    sch.running.append(a)
+
+    sch._kv_ready_fn = lambda seq: True   # KV arrived
+
+    seqs, is_prefill = sch.schedule()
+    assert is_prefill is False
+    assert a in seqs           # passes the gate and is decoded
+
+
+def test_kv_ready_fn_none_does_not_affect_decode(small_block):
+    """kv_ready_fn=None (unified mode) leaves existing decode behaviour unchanged."""
+    sch = make_scheduler()
+    assert sch._kv_ready_fn is None
+
+    a = Sequence([1, 2, 3, 4])
+    sch.add(a)
+    seqs, is_prefill = sch.schedule()
+    sch.postprocess(seqs, [10], is_prefill)
+
+    seqs2, is_prefill2 = sch.schedule()
+    assert is_prefill2 is False
+    assert a in seqs2          # decode proceeds normally without a gate
+
+
+def test_kv_ready_fn_all_blocked_returns_empty(small_block):
+    """If every running seq is blocked by kv_ready_fn, schedule returns ([], False)."""
+    sch = make_scheduler()
+
+    a = Sequence([1, 2, 3, 4])
+    sch.block_manager.allocate(a, 0)
+    a.status = SequenceStatus.KV_TRANSFERRING
+    a.num_cached_tokens = 4
+    sch.running.append(a)
+
+    sch._kv_ready_fn = lambda seq: False   # nothing ready
+
+    seqs, is_prefill = sch.schedule()
+    assert seqs == []
+    assert is_prefill is False
+    assert a in sch.running    # a still in queue
+
+
+def test_kv_skip_counter_resets_after_ready_sequence(small_block):
+    """A ready sequence resets the blocked-queue scan."""
+    sch = make_scheduler()
+    blocked = []
+    ready = []
+    for i in range(5):
+        seq = Sequence([i + 1, i + 2, i + 3, i + 4])
+        sch.block_manager.allocate(seq, 0)
+        seq.status = SequenceStatus.KV_TRANSFERRING
+        seq.num_cached_tokens = 4
+        sch.running.append(seq)
+        (ready if i in (0, 4) else blocked).append(seq)
+
+    sch._kv_ready_fn = lambda seq: seq in ready
+
+    seqs, is_prefill = sch.schedule()
+
+    assert is_prefill is False
+    assert seqs == ready
+    assert all(seq in sch.running for seq in blocked)

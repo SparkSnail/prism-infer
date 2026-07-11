@@ -15,6 +15,9 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        # KV readiness gate for PD disaggregation; None = unified mode (always ready).
+        # Injected by LLMEngine after connector setup.
+        self._kv_ready_fn = None
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -55,8 +58,25 @@ class Scheduler:
             return scheduled_seqs, True
 
         # decode
+        skipped_kv = 0
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
+
+            # prefill-only mode: on_prefill_done marks seq FINISHED before decode step.
+            # Clean up blocks and skip.
+            if seq.status == SequenceStatus.FINISHED:
+                self.block_manager.deallocate(seq)
+                continue
+
+            # KV readiness gate: KV_TRANSFERRING sequences wait until KV arrives.
+            if self._kv_ready_fn is not None and not self._kv_ready_fn(seq):
+                self.running.append(seq)   # requeue at tail; check next step
+                skipped_kv += 1
+                if skipped_kv >= len(self.running):
+                    # Went around the whole queue without finding a ready seq.
+                    break
+                continue
+
             while not self.block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
@@ -68,6 +88,7 @@ class Scheduler:
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
+                skipped_kv = 0
         # The sole running seq preempted itself (free+evictable exhausted).
         # It has been requeued; return empty so the caller skips this step gracefully.
         if not scheduled_seqs:

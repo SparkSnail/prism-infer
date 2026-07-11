@@ -28,10 +28,12 @@ import argparse
 import sys
 import time
 
+import torch
 import torch.distributed as dist
 
 from prism_infer.config import Config
 from prism_infer.engine.llm_engine import LLMEngine
+from prism_infer.engine.sequence import SequenceStatus
 from prism_infer.sampling_params import SamplingParams
 
 
@@ -83,8 +85,30 @@ def run_prefill(args):
 
     prompts = args.prompts or ["What is the weather like today?", "Give a brief introduction to quantum computing."]
     sp = SamplingParams(temperature=0, max_tokens=args.max_tokens)
+
+    # Capture the first generated token from each prefill so decode can start from it.
+    first_tokens: dict[int, int] = {}
+    original_postprocess = engine.scheduler.postprocess
+
+    def capture_first_tokens(seqs, token_ids, is_prefill):
+        if is_prefill:
+            for seq, token_id in zip(seqs, token_ids):
+                first_tokens[seq.seq_id] = token_id
+        return original_postprocess(seqs, token_ids, is_prefill)
+
+    engine.scheduler.postprocess = capture_first_tokens
+
     for p in prompts:
         engine.add_request(p, sp)
+
+    # Send block counts so the decode side can pre-allocate before KV arrives.
+    # D side must issue irecv before P side issues isend (NCCL P2P ordering).
+    block_counts = [
+        (len(engine.tokenizer.encode(prompt)) + config.kvcache_block_size - 1)
+        // config.kvcache_block_size
+        for prompt in prompts
+    ]
+    dist.send(torch.tensor(block_counts, dtype=torch.int64, device="cuda"), dst=1)
 
     print(f"[rank={rank}] prefill start, {len(prompts)} requests")
     t0 = time.perf_counter()
@@ -94,6 +118,26 @@ def run_prefill(args):
         step += 1
         if step % 10 == 0:
             print(f"[rank={rank}] step={step}, num_tokens={num_tokens}")
+
+    # Wait for any in-flight NCCL sends to complete before forwarding first tokens.
+    pusher = getattr(engine.kv_connector, "pusher", None)
+    assert pusher is not None, "prefill-only connector must provide a KV pusher"
+    transport = pusher.transport
+    for reqs, _chunks, _slices, _callback in list(
+        getattr(transport, "_pending", [])
+    ):
+        for request in reqs:
+            request.wait()
+    if hasattr(transport, "poll_completions"):
+        transport.poll_completions()
+
+    # Send the first token of each sequence (ordered by seq_id) so decode can
+    # start its first decode step without an extra prefill round.
+    ordered_first_tokens = [first_tokens[seq_id] for seq_id in sorted(first_tokens)]
+    dist.send(
+        torch.tensor(ordered_first_tokens, dtype=torch.int64, device="cuda"),
+        dst=1,
+    )
 
     elapsed = time.perf_counter() - t0
     print(f"[rank={rank}] prefill done in {elapsed:.2f}s ({step} steps)")
@@ -124,12 +168,29 @@ def run_decode(args):
     print(f"[rank={rank}] starting decode engine, model={args.model}")
     engine = LLMEngine(config)
 
-    # In production, serve injects sequences via KVReceiver.
-    # For M3 validation, decode side submits the same prompts directly.
     prompts = args.prompts or ["What is the weather like today?", "Give a brief introduction to quantum computing."]
     sp = SamplingParams(temperature=0, max_tokens=args.max_tokens)
-    for p in prompts:
-        engine.add_request(p, sp)
+
+    # Step 1: receive per-request block counts; pre-allocate and issue irecv so the
+    # D side is ready to receive before P side starts sending.
+    block_counts = torch.zeros(len(prompts), dtype=torch.int64, device="cuda")
+    dist.recv(block_counts, src=0)
+    received: list[tuple[str, list[int]]] = []
+    block_manager = engine.scheduler.block_manager
+    transport = engine.kv_connector.transport
+    for prompt, block_count in zip(prompts, block_counts.tolist()):
+        dst_blocks = [block_manager._allocate_block() for _ in range(int(block_count))]
+        transport.recv_kv(src_rank=0, block_ids=dst_blocks)
+        received.append((prompt, dst_blocks))
+
+    # Step 2: receive first token from P side (produced by prefill logits).
+    # D side starts decode from this token, avoiding a redundant prefill round.
+    first_tokens = torch.zeros(len(prompts), dtype=torch.int64, device="cuda")
+    dist.recv(first_tokens, src=0)
+    for (prompt, dst_blocks), first_token in zip(received, first_tokens.tolist()):
+        engine.add_request(prompt, sp)
+        seq = engine.scheduler.waiting[-1]
+        _activate_received_sequence(engine, seq, dst_blocks, int(first_token))
 
     print(f"[rank={rank}] decode waiting for KV transfer...")
     t0 = time.perf_counter()
@@ -163,8 +224,29 @@ def run_decode(args):
     return outputs_all
 
 
+def _activate_received_sequence(
+    engine: LLMEngine,
+    seq,
+    dst_blocks: list[int],
+    first_token: int,
+) -> None:
+    """Move a received-KV sequence directly into decode, skipping local prefill.
+
+    The P side has already run prefill and transferred KV into dst_blocks.
+    We set block_table, mark cached tokens, append the first token that the
+    P side produced, and move the sequence from waiting to running.
+    """
+    seq.block_table = dst_blocks
+    seq.num_cached_tokens = seq.num_prompt_tokens
+    seq.append_token(first_token)
+    seq.is_prefill = False
+    seq.status = SequenceStatus.RUNNING
+    engine.scheduler.waiting.remove(seq)
+    engine.scheduler.running.append(seq)
+
+
 def run_unified(args):
-    """Unified mode: prefill+decode in one process, used as baseline for M3 parity check."""
+    """Unified mode: prefill+decode in one process, used as baseline for parity check."""
     config = Config(
         model=args.model,
         engine_mode="unified",
