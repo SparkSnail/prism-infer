@@ -62,6 +62,14 @@ class Scheduler:
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
 
+            # Source KV must remain frozen until local migration finish or abort.
+            if seq.status == SequenceStatus.MIGRATING_OUT:
+                self.running.append(seq)
+                skipped_kv += 1
+                if skipped_kv >= len(self.running):
+                    break
+                continue
+
             # prefill-only mode: on_prefill_done marks seq FINISHED before decode step.
             # Clean up blocks and skip.
             if seq.status == SequenceStatus.FINISHED:

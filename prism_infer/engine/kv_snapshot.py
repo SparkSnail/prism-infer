@@ -13,11 +13,10 @@ if TYPE_CHECKING:
 
 @dataclass
 class SnapHandle:
-    """Opaque snapshot handle passed between serve and infer.
+    """Snapshot metadata without KV tensors.
 
-    Contains only metadata (block ids, token ids) -- no KV tensors.
-    KV data stays on the src GPU and is transferred separately via
-    NCCLTransport.send_kv() in Step 3 of the three-way handshake.
+    A caller performing remote recovery must transfer the referenced KV data
+    separately and prove receive completion before activation.
     """
     seq_id: str
     block_table: List[int]
@@ -52,7 +51,7 @@ def snapshot_sequence(
     seq: "Sequence",
     allow_unaligned: bool = False,
 ) -> SnapHandle:
-    """Capture a KV snapshot for migration (handshake Step 1).
+    """Capture local KV metadata for migration.
 
     Must be called after postprocess() when allow_unaligned=False: only then has
     store_kvcache fully written the last block. Calling mid-step risks a half-written
@@ -188,11 +187,7 @@ def pre_alloc_blocks(
     token_ids: List[int],
     block_manager: "BlockManager",
 ) -> Optional[List[int]]:
-    """Pre-allocate dst block slots (handshake Step 2).
-
-    Returns dst_block_ids on success, None if OOM.
-    On None, serve triggers ABORTED_DST and src keeps the sequence.
-    """
+    """Pre-allocate dst blocks transactionally; return None on OOM."""
     return _try_allocate_blocks(block_num, block_manager)
 
 
@@ -201,7 +196,7 @@ def commit_migration(
     handle: SnapHandle,
     seq: "Sequence",
 ) -> None:
-    """Transition dst sequence to active after KV transfer completes (handshake Step 3b).
+    """Activate a locally restored sequence after KV completion is proven.
 
     dst seq_id differs from handle.seq_id -- dst assigns a new local id via the
     global counter in Sequence.__init__. No cross-instance id consistency is enforced.
@@ -218,50 +213,36 @@ def free_pre_alloc(
     block_ids: List[int],
     block_manager: "BlockManager",
 ) -> None:
-    """Release dst pre-allocated blocks on ABORTED_DST or ABORTED_SRC."""
+    """Release blocks allocated by a local recovery attempt."""
     for b in block_ids:
         block_manager.release_block(b)
 
 
 def reset_to_waiting(seq: "Sequence") -> None:
-    """Revert a KV_TRANSFERRING sequence to WAITING for recompute fallback.
-
-    Called by serve when KV transfer times out and on_fail="recompute".
-    The decode instance re-runs prefill locally rather than waiting for KV.
-    """
+    """Revert a KV_TRANSFERRING sequence for a caller-authorized recompute."""
     from prism_infer.engine.sequence import SequenceStatus
     seq.status = SequenceStatus.WAITING
 
 
 def resume_after_abort(seq: "Sequence") -> None:
-    """Revert src sequence from MIGRATING_OUT to RUNNING after ABORTED_DST.
-
-    Migration failed at dst allocation; src continues inference normally.
-    """
+    """Resume a locally fenced source sequence after migration abort."""
     from prism_infer.engine.sequence import SequenceStatus
     seq.status = SequenceStatus.RUNNING
 
 
-# 30s matches a conservative prefill-to-transfer upper bound for long sequences;
-# keeps dst from leaking pre-alloc blocks if src crashes mid-handshake.
 MIGRATION_IN_TIMEOUT_S = 30.0
 
 
 class MigrationWatchdog:
-    """Background watchdog on dst: release pre-alloc blocks if handshake times out.
+    """Store pre-allocated blocks for legacy local migration helpers.
 
-    Mirrors Llumnix _watch_pending_migrate_in_requests_loop.
-
-    Usage:
-        watchdog = MigrationWatchdog(block_manager)
-        asyncio.create_task(watchdog.watch_loop())  # started in LLMEngine.__init__
-        watchdog.register(seq_id, dst_blocks)       # after Step 2 pre_alloc
-        watchdog.commit(seq_id)                     # after Step 3 commit
+    No runtime owner starts watch_loop. This class does not provide remote
+    writer fencing, automatic reclamation, or DATA_READY semantics.
     """
 
     def __init__(self, block_manager: "BlockManager"):
         self.block_manager = block_manager
-        self._pending: Dict[str, tuple] = {}  # seq_id -> (blocks, timestamp)
+        self._pending: Dict[str, tuple] = {}
 
     def register(self, seq_id: str, blocks: List[int]) -> None:
         self._pending[seq_id] = (blocks, time.monotonic())
@@ -275,6 +256,7 @@ class MigrationWatchdog:
         return list(entry[0]) if entry is not None else None
 
     async def watch_loop(self) -> None:
+        """Legacy scan loop; not an active runtime guarantee."""
         while True:
             await asyncio.sleep(MIGRATION_IN_TIMEOUT_S / 2)
             now = time.monotonic()

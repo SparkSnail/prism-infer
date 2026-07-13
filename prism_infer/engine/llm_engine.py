@@ -1,5 +1,4 @@
 import atexit
-import asyncio
 import os
 import socket
 import uuid
@@ -93,12 +92,17 @@ class LLMEngine:
         # unified: no-op; prefill-only: fires KVBlockPusher; decode-only: polls KVReceiver.
         from prism_infer.engine.kv_connector import _build_connector
         kv_cache = getattr(self.model_runner, "kv_cache", None)
-        self.kv_connector = _build_connector(config, kv_cache=kv_cache)
+        self.kv_connector = _build_connector(
+            config,
+            kv_cache=kv_cache,
+            block_manager=self.scheduler.block_manager,
+        )
         self.scheduler._kv_ready_fn = self.kv_connector.on_before_decode
 
+        # Remote migration fencing and supervisor-owned reclamation are not
+        # provided by this local helper state.
         from prism_infer.engine.kv_snapshot import MigrationWatchdog
         self._migration_watchdog = MigrationWatchdog(self.scheduler.block_manager)
-        self._watchdog_started = False
 
     def exit(self):
         self.model_runner.call("exit")
@@ -117,6 +121,8 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
+        # Pending sends outlive their source Sequence and still need progress.
+        self.kv_connector.poll()
         seqs, is_prefill = self.scheduler.schedule()
         # The sole running seq may have self-preempted under extreme memory pressure;
         # skip the model call and return empty for this step.
@@ -145,17 +151,12 @@ class LLMEngine:
             if seq.is_finished:
                 outputs.append((seq.seq_id, seq.completion_token_ids))
 
-        if hasattr(self.kv_connector, 'transport') and hasattr(
-                self.kv_connector.transport, 'poll_completions'):
-            self.kv_connector.transport.poll_completions()
-
-        if hasattr(self.kv_connector, 'poll_recv'):
-            self.kv_connector.poll_recv()
+        self.kv_connector.poll()
 
         return outputs, num_tokens
 
     def is_finished(self):
-        return self.scheduler.is_finished()
+        return self.scheduler.is_finished() and not self.kv_connector.has_pending()
 
     def generate(
         self,
@@ -190,32 +191,16 @@ class LLMEngine:
         outputs = [by_seq_id[seq_id] for seq_id in sorted(by_seq_id)]
         return [{"text": self.tokenizer.decode(ids), "token_ids": ids} for ids in outputs]
 
-    # -------------------------------------------------------------------------
-    # Migration RPC entry points (three-way handshake, infer side)
-    # -------------------------------------------------------------------------
-
     def handle_migrate_req(self, req) -> dict:
-        """Snapshot a sequence for migration (handshake Step 1).
+        """Create a local migration snapshot.
 
-        serve flow:
-          Step 1: src.handle_migrate_req(req)         -> SnapHandle
-          Step 2: dst.pre_alloc_blocks_for_migration  -> dst_block_ids
-          Step 3: src transfers KV; dst.commit_migration_for_seq
-
-        Returns {"success": True, "handle": SnapHandle} or {"success": False, "error": str}.
+        This helper does not provide remote RPC, DATA_READY fencing, retries,
+        or supervisor ownership.
         """
         from prism_infer.engine.kv_snapshot import (
             snapshot_sequence, incremental_snapshot,
         )
         from prism_infer.engine.sequence import SequenceStatus
-
-        if not self._watchdog_started:
-            try:
-                loop = asyncio.get_event_loop()
-                loop.create_task(self._migration_watchdog.watch_loop())
-                self._watchdog_started = True
-            except RuntimeError:
-                pass  # no running event loop in sync context
 
         seq_id = int(req.seq_id)
         seq = None
@@ -246,10 +231,7 @@ class LLMEngine:
         block_num: int,
         token_ids: list,
     ) -> dict:
-        """Pre-allocate dst block slots (handshake Step 2).
-
-        Returns {"success": True, "dst_blocks": [...]} or {"success": False, "error": str}.
-        """
+        """Pre-allocate blocks for the local migration helper."""
         from prism_infer.engine.kv_snapshot import pre_alloc_blocks
         dst_blocks = pre_alloc_blocks(
             seq_id, block_num, token_ids,
@@ -261,10 +243,9 @@ class LLMEngine:
         return {"success": True, "dst_blocks": dst_blocks}
 
     def commit_migration_for_seq(self, seq_id: str, handle, sampling_params) -> dict:
-        """Transition dst sequence to active after KV transfer completes (handshake Step 3b).
+        """Activate a locally restored sequence after the caller proves KV readiness.
 
-        Uses blocks pre-allocated in Step 2 (already contain the transferred KV data).
-        Returns {"success": True} or {"success": False, "error": str}.
+        This helper does not establish a remote receive-completion fence.
         """
         from prism_infer.engine.kv_snapshot import apply_snapshot, commit_migration
         from prism_infer.engine.sequence import SequenceStatus
@@ -274,7 +255,7 @@ class LLMEngine:
             if dst_blocks is None:
                 return {
                     "success": False,
-                    "error": f"seq_id={seq_id} has no pre-allocated blocks (Step 2 missing or timed out)",
+                    "error": f"seq_id={seq_id} has no pre-allocated blocks",
                 }
             seq = apply_snapshot(
                 handle,

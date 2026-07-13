@@ -3,30 +3,41 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
+    from prism_infer.engine.block_manager import BlockManager
     from prism_infer.engine.sequence import Sequence
     from prism_infer.engine.kv_transfer import KVBlockPusher, KVReceiver
     from prism_infer.config import Config
 
 
 class KVConnector(Protocol):
-    """Single choke-point for PD-role behaviour. LLMEngine calls only these two hooks."""
+    """Own PD-role hooks and asynchronous completion progress."""
 
     def on_prefill_done(self, seq: "Sequence") -> None: ...
     def on_before_decode(self, seq: "Sequence") -> bool: ...
+    def poll(self) -> None: ...
+    def has_pending(self) -> bool: ...
 
 
 class UnifiedConnector:
-    """unified mode: both hooks are no-ops; behaviour identical to pre-I4."""
+    """No-op connector for unified inference."""
     def on_prefill_done(self, seq: "Sequence") -> None: pass
     def on_before_decode(self, seq: "Sequence") -> bool: return True
+    def poll(self) -> None: pass
+    def has_pending(self) -> bool: return False
 
 
 class PrefillConnector:
     """prefill-only mode: push KV to decode instance after prefill completes."""
 
-    def __init__(self, pusher: "KVBlockPusher", config: "Config"):
+    def __init__(
+        self,
+        pusher: "KVBlockPusher",
+        config: "Config",
+        block_manager: "BlockManager",
+    ):
         self.pusher = pusher
         self.config = config
+        self.block_manager = block_manager
 
     def on_prefill_done(self, seq: "Sequence") -> None:
         # After pushing KV, mark FINISHED so the scheduler cleans up this seq.
@@ -41,10 +52,22 @@ class PrefillConnector:
             src_instance=self.config.instance_id or "prefill-0",
             dst_instance=self.config.pd_decode_addr,
             block_table=seq.block_table[:],
-            block_hint=[],  # no hint yet: send full KV (serve will populate on S1/KV-affinity route)
+            block_hint=[],  # No remote cache hint: send the complete KV set.
             on_fail=getattr(self.config, "kv_transfer_on_fail", "recompute"),
         )
-        self.pusher.transfer(req)
+        delta_blocks = self.pusher.required_blocks(req)
+        if delta_blocks:
+            self.block_manager.retain_for_transfer(req.op_id, delta_blocks)
+        try:
+            self.pusher.transfer(
+                req,
+                on_complete=lambda: self.block_manager.release_transfer_retain(
+                    req.op_id
+                ),
+            )
+        except Exception:
+            self.block_manager.release_transfer_retain(req.op_id)
+            raise
         seq.status = SequenceStatus.FINISHED
 
     def on_before_decode(self, seq: "Sequence") -> bool:
@@ -52,6 +75,12 @@ class PrefillConnector:
             f"PrefillConnector.on_before_decode called for seq {seq.seq_id}; "
             "prefill-only engine must not run decode steps"
         )
+
+    def poll(self) -> None:
+        self.pusher.poll()
+
+    def has_pending(self) -> bool:
+        return self.pusher.has_pending()
 
 
 class DecodeConnector:
@@ -103,8 +132,18 @@ class DecodeConnector:
         for sid in done:
             del self._pending_recv[sid]
 
+    def poll(self) -> None:
+        self.poll_recv()
 
-def _build_connector(config: "Config", kv_cache=None) -> KVConnector:
+    def has_pending(self) -> bool:
+        return bool(self._pending_recv)
+
+
+def _build_connector(
+    config: "Config",
+    kv_cache=None,
+    block_manager: "BlockManager | None" = None,
+) -> KVConnector:
     """Return the appropriate connector for the configured engine_mode."""
     mode = getattr(config, "engine_mode", "unified")
 
@@ -126,7 +165,12 @@ def _build_connector(config: "Config", kv_cache=None) -> KVConnector:
             max_bytes_inflight=config.max_bytes_inflight,
             max_blocks_per_peer=config.max_blocks_per_peer,
         )
-        return PrefillConnector(pusher=pusher, config=config)
+        assert block_manager is not None, "prefill-only connector requires BlockManager"
+        return PrefillConnector(
+            pusher=pusher,
+            config=config,
+            block_manager=block_manager,
+        )
 
     if mode == "decode-only":
         from prism_infer.engine.kv_transfer import KVReceiver, build_transport

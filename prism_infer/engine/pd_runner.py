@@ -119,18 +119,6 @@ def run_prefill(args):
         if step % 10 == 0:
             print(f"[rank={rank}] step={step}, num_tokens={num_tokens}")
 
-    # Wait for any in-flight NCCL sends to complete before forwarding first tokens.
-    pusher = getattr(engine.kv_connector, "pusher", None)
-    assert pusher is not None, "prefill-only connector must provide a KV pusher"
-    transport = pusher.transport
-    for reqs, _chunks, _slices, _callback in list(
-        getattr(transport, "_pending", [])
-    ):
-        for request in reqs:
-            request.wait()
-    if hasattr(transport, "poll_completions"):
-        transport.poll_completions()
-
     # Send the first token of each sequence (ordered by seq_id) so decode can
     # start its first decode step without an extra prefill round.
     ordered_first_tokens = [first_tokens[seq_id] for seq_id in sorted(first_tokens)]

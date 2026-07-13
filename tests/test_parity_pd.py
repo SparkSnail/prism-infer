@@ -113,12 +113,6 @@ def _worker_main() -> None:
         while not engine.is_finished():
             engine.step()
 
-        transport = engine.kv_connector.pusher.transport
-        for requests, _chunks, _slices, _callback in list(transport._pending):
-            for request in requests:
-                request.wait()
-        transport.poll_completions()
-
         dist.send(
             torch.tensor([captured["first"]], dtype=torch.int64, device="cuda"),
             dst=1,

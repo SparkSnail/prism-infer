@@ -63,6 +63,21 @@ def test_decode_step_after_prefill(small_block):
     assert a.num_scheduled_tokens == 1
     assert a.is_prefill is False
 
+
+def test_migrating_out_sequence_is_not_scheduled_for_decode(small_block):
+    sch = make_scheduler()
+    seq = Sequence([1, 2, 3, 4])
+    sch.block_manager.allocate(seq, 0)
+    seq.status = SequenceStatus.MIGRATING_OUT
+    sch.running.append(seq)
+
+    seqs, is_prefill = sch.schedule()
+
+    assert seqs == []
+    assert is_prefill is False
+    assert list(sch.running) == [seq]
+    assert seq.num_scheduled_tokens == 0
+
 def test_preempt_releases_blocks_and_requeues(small_block):
     sch = make_scheduler()
     a = Sequence([1, 2, 3, 4])

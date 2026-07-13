@@ -128,7 +128,7 @@ class ChunkedBlock:
 class KVTransportBackend(Protocol):
     """Unified transport interface. KVBlockPusher depends only on this protocol.
 
-    ack() triggers P-side block release only -- no RPC to serve.
+    ack() does not own source block lifetime or send an RPC to serve.
     serve detects KV readiness by polling per-request state (KV_TRANSFERRING -> RUNNING).
     """
 
@@ -151,6 +151,7 @@ class KVTransportBackend(Protocol):
             self.send_async(dst, chunk, on_complete=cb)
 
     def ack(self, op_id: str, dst: str, bytes_sent: int) -> None: ...
+    def has_pending(self) -> bool: ...
 
 
 def _calc_block_bytes(kv_cache: torch.Tensor, block_size: int) -> int:
@@ -197,19 +198,66 @@ class KVBlockPusher:
         self.deferred: dict[str, deque] = defaultdict(deque)
         # op_id -> [total_chunks, done_chunks, dst, bytes_done]
         self._op_tracker: dict[str, list] = {}
+        self._op_callbacks: dict[str, Callable[[], None]] = {}
 
-    def transfer(self, req: TransferReq) -> None:
+    def required_blocks(self, req: TransferReq) -> list[int]:
+        hint = set(req.block_hint)
+        return [block_id for block_id in req.block_table if block_id not in hint]
+
+    def transfer(
+        self,
+        req: TransferReq,
+        on_complete: Callable[[], None] | None = None,
+    ) -> None:
         """Initiate KV transfer for one sequence (called after prefill completes)."""
-        dst   = req.dst_instance
-        hint  = set(req.block_hint)
-        delta = [b for b in req.block_table if b not in hint]
+        dst = req.dst_instance
+        delta = self.required_blocks(req)
         if not delta:
-            # Full prefix hit: all blocks already on D side.
             self.transport.ack(req.op_id, dst, bytes_sent=0)
+            if on_complete is not None:
+                on_complete()
             return
         chunks = self._coalesce(delta, req.seq_id, req.op_id)
+        assert req.op_id not in self._op_tracker, (
+            f"duplicate local transfer operation: {req.op_id!r}"
+        )
         self._op_tracker[req.op_id] = [len(chunks), 0, dst, 0]
-        self._flush_or_defer(dst, chunks)
+        if on_complete is not None:
+            self._op_callbacks[req.op_id] = on_complete
+        try:
+            self._flush_or_defer(dst, chunks)
+        except Exception:
+            self._cancel_local_op(req.op_id)
+            raise
+
+    def poll(self) -> None:
+        poll_completions = getattr(self.transport, "poll_completions", None)
+        if poll_completions is not None:
+            poll_completions()
+
+    def has_pending(self) -> bool:
+        transport_pending = getattr(self.transport, "has_pending", None)
+        return (
+            bool(self._op_tracker)
+            or any(self.deferred.values())
+            or self.bytes_inflight != 0
+            or any(self.blocks_inflight.values())
+            or (transport_pending is not None and transport_pending())
+        )
+
+    def _cancel_local_op(self, op_id: str) -> None:
+        for dst, queue in list(self.deferred.items()):
+            self.deferred[dst] = deque(
+                item for item in queue if item[1].op_id != op_id
+            )
+        self._op_tracker.pop(op_id, None)
+        self._op_callbacks.pop(op_id, None)
+
+    def _fail_local_op(self, op_id: str) -> None:
+        callback = self._op_callbacks.get(op_id)
+        self._cancel_local_op(op_id)
+        if callback is not None:
+            callback()
 
     def _flush_or_defer(self, dst: str, new_chunks: list[ChunkedBlock]) -> None:
         for c in new_chunks:
@@ -217,7 +265,7 @@ class KVBlockPusher:
         self._flush_deferred(dst)
 
     def _flush_deferred(self, dst: str) -> None:
-        """Greedily collect pushable chunks and send as one batch (one kernel launch)."""
+        """Greedily collect pushable chunks into one grouped API submission."""
         q = self.deferred[dst]
         batch: list[ChunkedBlock] = []
         tb  = self.bytes_inflight
@@ -238,10 +286,19 @@ class KVBlockPusher:
         tot_bl = sum(len(c.block_ids) for c in batch)
         self.bytes_inflight       += tot_b
         self.blocks_inflight[dst] += tot_bl
-        self.transport.send_batch_async(
-            dst, batch,
-            on_complete=lambda: self._on_batch_complete(dst, tot_b, tot_bl, batch),
-        )
+        try:
+            self.transport.send_batch_async(
+                dst, batch,
+                on_complete=lambda: self._on_batch_complete(
+                    dst, tot_b, tot_bl, batch
+                ),
+            )
+        except Exception:
+            self.bytes_inflight -= tot_b
+            self.blocks_inflight[dst] -= tot_bl
+            for op_id in {chunk.op_id for chunk in batch}:
+                self._fail_local_op(op_id)
+            raise
 
     def _on_batch_complete(
         self, dst: str, bytes_sent: int, blocks_sent: int,
@@ -258,6 +315,9 @@ class KVBlockPusher:
                 if t[1] == t[0]:
                     del self._op_tracker[op]
                     self.transport.ack(op, t[2], t[3])
+                    callback = self._op_callbacks.pop(op, None)
+                    if callback is not None:
+                        callback()
         self._flush_deferred(dst)
 
     def _coalesce(self, block_ids: list[int], seq_id: str, op_id: str) -> list[ChunkedBlock]:
@@ -430,8 +490,11 @@ class NCCLTransport:
                 still.append((reqs, chunks, slices, cb))
         self._pending = still
 
+    def has_pending(self) -> bool:
+        return bool(self._pending)
+
     def ack(self, op_id: str, dst: str, bytes_sent: int) -> None:
-        pass  # P-side block release only; no RPC to serve
+        pass
 
 
 class CUDAIPCTransport:
@@ -462,6 +525,9 @@ class CUDAIPCTransport:
 
     def ack(self, op_id: str, dst: str, bytes_sent: int) -> None:
         pass
+
+    def has_pending(self) -> bool:
+        return False
 
 
 class _null_ctx:

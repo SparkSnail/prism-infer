@@ -118,6 +118,7 @@ class BlockManager:
         self._consumer_lease_s = prefix_consumer_lease_s
         self._transfer_pins: dict[str, tuple[int, ...]] = {}
         self._transfer_pin_counts: dict[int, int] = {}
+        self._pd_transfer_retains: dict[str, tuple[int, ...]] = {}
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -191,11 +192,51 @@ class BlockManager:
 
     def release_block(self, block_id: int) -> None:
         """Decrement ref_count for a single block; return it to the pool when it reaches zero."""
-        block = self.blocks[block_id]
-        assert block.ref_count > 0, f"block {block_id} ref_count is already 0"
-        block.ref_count -= 1
-        if block.ref_count == 0:
-            self._deallocate_block(block_id)
+        with self._prefix_state_lock:
+            block = self.blocks[block_id]
+            assert block.ref_count > 0, f"block {block_id} ref_count is already 0"
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
+    def retain_for_transfer(
+        self,
+        operation_id: str,
+        block_ids: list[int],
+    ) -> tuple[int, ...]:
+        """Hold source blocks until an asynchronous PD transfer completes."""
+        retained = tuple(block_ids)
+        assert retained, f"transfer {operation_id!r} cannot retain an empty block list"
+        assert len(set(retained)) == len(retained), (
+            f"transfer {operation_id!r} contains duplicate blocks: {retained!r}"
+        )
+        with self._prefix_state_lock:
+            existing = self._pd_transfer_retains.get(operation_id)
+            if existing is not None:
+                assert existing == retained, (
+                    f"transfer {operation_id!r} changed blocks: "
+                    f"existing={existing!r}, requested={retained!r}"
+                )
+                return existing
+            missing = [block_id for block_id in retained
+                       if block_id not in self.used_block_ids]
+            assert not missing, (
+                f"transfer {operation_id!r} cannot retain unused blocks: {missing!r}"
+            )
+            for block_id in retained:
+                self.blocks[block_id].ref_count += 1
+            self._pd_transfer_retains[operation_id] = retained
+            return retained
+
+    def release_transfer_retain(self, operation_id: str) -> bool:
+        """Release a PD transfer retain once; return False if already released."""
+        with self._prefix_state_lock:
+            block_ids = self._pd_transfer_retains.pop(operation_id, None)
+            if block_ids is None:
+                return False
+            for block_id in block_ids:
+                self.release_block(block_id)
+            return True
 
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
