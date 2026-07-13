@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Protocol
 
 import torch
@@ -22,6 +23,93 @@ class TransferReq:
     #   "recompute" -> D side re-runs prefill locally; request succeeds at higher latency
     #   "fail"      -> request fails immediately
     timeout_ms: int = 5000
+
+
+@dataclass(frozen=True)
+class MappedPrefixTransferReq:
+    op_id: str
+    req_id: str
+    src_instance: str
+    src_instance_epoch: str
+    dst_instance: str
+    dst_instance_epoch: str
+    src_block_ids: tuple[int, ...]
+    dst_block_ids: tuple[int, ...]
+    namespace: str
+    kv_compatibility_id: str
+    request_context_digest: str
+
+    def __post_init__(self):
+        assert self.op_id, "mapped transfer requires op_id"
+        assert len(self.src_block_ids) == len(self.dst_block_ids), (
+            f"mapped block count mismatch: {self.src_block_ids=} {self.dst_block_ids=}"
+        )
+
+
+class MappedTransferStatus(str, Enum):
+    PREPARED = "PREPARED"
+    RUNNING = "RUNNING"
+    COMPLETED = "COMPLETED"
+    FENCED = "FENCED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass
+class MappedTransferOperation:
+    request: MappedPrefixTransferReq
+    status: MappedTransferStatus = MappedTransferStatus.PREPARED
+    source_fenced: bool = False
+    target_fenced: bool = False
+
+
+class MappedTransferRegistry:
+    """Track control-plane state while the backend owns the write fence."""
+
+    def __init__(self):
+        self._operations: dict[str, MappedTransferOperation] = {}
+
+    def prepare(self, request: MappedPrefixTransferReq) -> MappedTransferOperation:
+        existing = self._operations.get(request.op_id)
+        if existing is not None:
+            if existing.request != request:
+                raise ValueError("operation id reused with different mapped transfer")
+            return existing
+        operation = MappedTransferOperation(request)
+        self._operations[request.op_id] = operation
+        return operation
+
+    def mark_running(self, op_id: str) -> None:
+        operation = self._operations[op_id]
+        if operation.status == MappedTransferStatus.PREPARED:
+            operation.status = MappedTransferStatus.RUNNING
+
+    def mark_completed(self, op_id: str) -> None:
+        operation = self._operations[op_id]
+        if operation.status not in {MappedTransferStatus.FENCED, MappedTransferStatus.UNKNOWN}:
+            operation.status = MappedTransferStatus.COMPLETED
+
+    def abort_result(
+        self, op_id: str, *, source_fenced: bool, target_fenced: bool
+    ) -> MappedTransferStatus:
+        operation = self._operations.get(op_id)
+        if operation is None:
+            return MappedTransferStatus.UNKNOWN
+        if operation.status == MappedTransferStatus.COMPLETED:
+            return MappedTransferStatus.COMPLETED
+        operation.source_fenced = source_fenced
+        operation.target_fenced = target_fenced
+        operation.status = (
+            MappedTransferStatus.FENCED
+            if source_fenced and target_fenced else MappedTransferStatus.UNKNOWN
+        )
+        return operation.status
+
+    def status(self, op_id: str) -> MappedTransferStatus:
+        operation = self._operations.get(op_id)
+        return operation.status if operation is not None else MappedTransferStatus.UNKNOWN
+
+    def contains(self, op_id: str) -> bool:
+        return op_id in self._operations
 
 
 @dataclass

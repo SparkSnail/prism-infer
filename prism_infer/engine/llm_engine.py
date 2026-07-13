@@ -69,6 +69,14 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        instance_id = config.instance_id or f"infer-{os.getpid()}"
+        self.scheduler.block_manager.instance_id = instance_id
+        self.scheduler.block_manager.instance_epoch = uuid.uuid4().hex
+        from prism_infer.engine.prefix_cache import PrefixCacheService
+        self.prefix_cache = PrefixCacheService(
+            self.scheduler.block_manager,
+            getattr(self.model_runner, "kv_cache", None),
+        )
 
         # CPU offload is only safe on single-GPU (TP=1, EP=1): multi-GPU EP has no
         # mechanism to synchronise per-rank offload state across ranks.
