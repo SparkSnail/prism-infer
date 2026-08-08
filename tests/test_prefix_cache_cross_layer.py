@@ -1,6 +1,8 @@
 import pytest
 import torch
 
+pytest.importorskip("prism_serve", reason="cross-repository integration test")
+
 from prism_infer.engine.block_manager import BlockManager
 from prism_infer.engine.prefix_cache import PrefixCacheService
 from prism_infer.engine.sequence import Sequence

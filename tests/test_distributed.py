@@ -1,7 +1,7 @@
 from unittest.mock import MagicMock, patch
 import pytest
 
-from prism_infer.utils.distributed import DistributedContext
+from prism_infer.utils.distributed import DistributedContext, PairGroupRegistry
 
 
 def _make_ctx(rank: int, world_size: int = 4, tp_size: int = 1) -> DistributedContext:
@@ -75,3 +75,28 @@ def test_create_pd_groups_tp1_single_pair():
         ctx.create_pd_groups(prefill_ranks=[0], decode_ranks=[1])
     assert len(ctx.pd_groups) == 1
     assert ctx.pd_peer_rank == 1
+
+
+def test_pair_group_registry_uses_canonical_five_group_order():
+    calls_received = []
+
+    def fake_new_group(ranks, **kwargs):
+        calls_received.append(tuple(ranks))
+        return f"group-{len(calls_received)}"
+
+    registry = PairGroupRegistry(global_rank=2)
+    with patch("torch.distributed.new_group", side_effect=fake_new_group):
+        registry.create_all()
+
+    assert calls_received == [(0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+    assert registry.group_peer("p0--d0", 0) == 1
+    assert registry.global_peer("p0--d0", 0) == 2
+    assert registry.group_peer("d0--d1", 2) == 1
+
+
+def test_pair_group_registry_rejects_nonmember_rank_translation():
+    registry = PairGroupRegistry(global_rank=0)
+    with patch("torch.distributed.new_group", return_value=MagicMock()):
+        registry.create_all()
+    with pytest.raises(ValueError, match="not a member"):
+        registry.group_peer("d0--d1", 0)

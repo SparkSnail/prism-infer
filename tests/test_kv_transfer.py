@@ -4,6 +4,7 @@ from collections import defaultdict
 
 from prism_infer.engine.kv_transfer import (
     TransferReq, ChunkedBlock, KVBlockPusher, KVReceiver, NCCLTransport,
+    EndpointFenceStatus, EndpointTransferRegistry,
     _calc_block_bytes,
 )
 
@@ -341,3 +342,107 @@ def test_nccl_poll_preserves_work_enqueued_by_completion_callback():
     transport.poll_completions()
 
     assert transport._pending == [next_entry]
+
+
+class _Work:
+
+    def __init__(self, terminal: bool):
+        self.terminal = terminal
+
+    def is_completed(self):
+        return self.terminal
+
+
+class _Event:
+
+    def __init__(self, terminal: bool):
+        self.terminal = terminal
+
+    def query(self):
+        return self.terminal
+
+
+def test_endpoint_transfer_fence_requires_work_and_cuda_terminal():
+    registry = EndpointTransferRegistry()
+    registry.register(
+        "ref-source-1", resource_kinds=("SOURCE_RETAIN", "TRANSFER_BYTES")
+    )
+    registry.mark_launched("ref-source-1", [_Work(True)], _Event(False))
+
+    snapshot = registry.abort("ref-source-1")
+
+    assert snapshot.status == EndpointFenceStatus.UNKNOWN
+    assert snapshot.resources_held is True
+    assert snapshot.held_resource_kinds == ("SOURCE_RETAIN", "TRANSFER_BYTES")
+
+
+def test_endpoint_transfer_ignores_unrecorded_cuda_event_state():
+    registry = EndpointTransferRegistry()
+    registry.register("ref-source-1", resource_kinds=("TRANSFER_BYTES",))
+    registry.mark_launched("ref-source-1", [_Work(True)], _Event(True))
+
+    snapshot = registry.status("ref-source-1")
+
+    assert snapshot.work_terminal is False
+    assert snapshot.cuda_visibility_terminal is False
+    assert snapshot.status == EndpointFenceStatus.UNKNOWN
+    registry.mark_work_terminal("ref-source-1")
+    assert registry.status("ref-source-1").work_terminal is True
+    with pytest.raises(ValueError, match="completion event was not recorded"):
+        registry.mark_data_complete("ref-source-1")
+
+
+def test_endpoint_transfer_unlaunched_abort_is_fenced_without_release():
+    registry = EndpointTransferRegistry()
+    registry.register("ref-target-1", resource_kinds=("TARGET_PENDING",))
+
+    snapshot = registry.abort("ref-target-1")
+
+    assert snapshot.status == EndpointFenceStatus.FENCED
+    assert snapshot.resources_held is True
+
+
+def test_endpoint_transfer_completion_proves_terminal_but_keeps_resources():
+    registry = EndpointTransferRegistry()
+    registry.register("ref-source-1", resource_kinds=("TRANSFER_BYTES",))
+    registry.mark_launched(
+        "ref-source-1", [_Work(True), _Work(True)], _Event(True)
+    )
+    registry.mark_work_terminal("ref-source-1")
+    registry.mark_completion_event_recorded("ref-source-1")
+    registry.mark_data_complete("ref-source-1")
+
+    snapshot = registry.status("ref-source-1")
+
+    assert snapshot.status == EndpointFenceStatus.COMPLETED
+    assert snapshot.work_terminal is True
+    assert snapshot.cuda_visibility_terminal is True
+    assert snapshot.resources_held is True
+
+
+def test_endpoint_transfer_cuda_terminal_is_monotonic_after_first_true():
+    class OneShotEvent:
+
+        def __init__(self):
+            self.query_calls = 0
+
+        def query(self):
+            self.query_calls += 1
+            if self.query_calls == 1:
+                return True
+            raise RuntimeError("terminal CUDA event must not be queried again")
+
+    registry = EndpointTransferRegistry()
+    event = OneShotEvent()
+    registry.register("ref-source-1", resource_kinds=("TRANSFER_BYTES",))
+    registry.mark_launched("ref-source-1", [_Work(True)], event)
+    registry.mark_work_terminal("ref-source-1")
+    registry.mark_completion_event_recorded("ref-source-1")
+    registry.mark_data_complete("ref-source-1")
+
+    first = registry.status("ref-source-1")
+    replay = registry.status("ref-source-1")
+
+    assert first.status == EndpointFenceStatus.COMPLETED
+    assert replay.status == EndpointFenceStatus.COMPLETED
+    assert event.query_calls == 1

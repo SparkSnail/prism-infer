@@ -24,6 +24,9 @@ class Config:
     shm_name: str = ""
     # False for EP standalone (torchrun); True for TP shm+Event worker loop.
     _use_shm_worker_loop: bool = True
+    # Injected after process-group creation for PD transport setup.
+    _pd_group: object | None = None
+    _pd_rank: int = 1
 
     engine_mode: str = "unified"
     # "unified"       default, prefill+decode in one engine (zero regression)

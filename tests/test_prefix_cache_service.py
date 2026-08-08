@@ -74,6 +74,30 @@ def test_remote_prepare_oom_rolls_back(small_block):
     assert len(target.block_manager.free_block_ids) == 1
 
 
+def test_partial_tail_block_is_not_installed_as_reusable_prefix():
+    service = PrefixCacheService(BlockManager(4, 256, instance_id="dst"))
+    operation = service.prepare(
+        "cold", "request", mode="remote_transfer", block_count=4,
+        token_ids=list(range(769)), sampling_params=SamplingParams(),
+    )
+    assert operation is not None
+    sequence = service.commit(
+        "cold",
+        namespace="ns",
+        kv_compatibility_id="compat",
+        request_context_digest="text",
+        cached_prefix_tokens=769,
+        transfer_proven=True,
+    )
+
+    assert len(sequence.block_table) == 4
+    reusable = sequence.block_table[:3]
+    partial = sequence.block_table[3]
+    assert all(service.block_manager.blocks[block].token_ids for block in reusable)
+    assert service.block_manager.blocks[partial].token_ids == []
+    assert service.block_manager.blocks[partial].hash == -1
+
+
 def test_resource_counts_are_read_from_infer_registries(small_block):
     source, sequence = _source(small_block)
     expected = [(source.block_manager.blocks[sequence.block_table[0]].hash, list(range(4)))]
@@ -104,7 +128,34 @@ def test_abort_pending_is_idempotent_and_commit_is_irreversible(small_block):
     )
     assert target.abort("op") == PrefixOperationStatus.ABORTED
     assert target.abort("op") == PrefixOperationStatus.ABORTED
+    assert len(target.block_manager.free_block_ids) == 3
+    assert target.resource_counts()["pending_allocations"] == 1
+    released = target.finalize_release("op", ("TARGET_PENDING",))
+    assert released == {"TARGET_PENDING": 1}
     assert len(target.block_manager.free_block_ids) == 4
+
+
+def test_committed_sequence_abort_holds_blocks_until_generic_finalize(small_block):
+    target = PrefixCacheService(BlockManager(4, 4, instance_id="dst"))
+    target.prepare(
+        "op", "r", mode="remote_transfer", block_count=1,
+        token_ids=list(range(5)), sampling_params=SamplingParams(),
+    )
+    sequence = target.commit(
+        "op", namespace="", kv_compatibility_id="",
+        request_context_digest="", cached_prefix_tokens=4,
+        transfer_proven=True,
+    )
+    owned = tuple(sequence.block_table)
+    assert sequence.defer_deallocation is True
+    assert target.abort_sequence("op") is True
+    assert tuple(sequence.block_table) == owned
+    assert set(owned) <= target.block_manager.used_block_ids
+    assert target.finalize_release("op", ("TARGET_SEQUENCE",)) == {
+        "TARGET_SEQUENCE": 1
+    }
+    assert sequence.block_table == []
+    assert sequence.defer_deallocation is False
 
 
 def test_missing_tensor_backend_fails_unknown_without_commit(small_block):
@@ -166,6 +217,8 @@ def test_watchdog_aborts_only_unstarted_prepared_operation(small_block):
     expired = target.expire_unstarted(1.0, now=operation.created_at + 2.0)
     assert expired == ["op"]
     assert target.status("op") == PrefixOperationStatus.ABORTED
+    assert len(target.block_manager.free_block_ids) == 3
+    target.finalize_release("op", ("TARGET_PENDING",))
     assert len(target.block_manager.free_block_ids) == 4
 
 

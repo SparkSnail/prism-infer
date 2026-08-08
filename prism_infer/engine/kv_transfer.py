@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from enum import Enum
@@ -110,6 +108,129 @@ class MappedTransferRegistry:
 
     def contains(self, op_id: str) -> bool:
         return op_id in self._operations
+
+
+class EndpointFenceStatus(str, Enum):
+    COMPLETED = "COMPLETED"
+    FENCED = "FENCED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class EndpointFenceSnapshot:
+    endpoint_ref_key: str
+    status: EndpointFenceStatus
+    work_terminal: bool
+    cuda_visibility_terminal: bool
+    resources_held: bool
+    held_resource_kinds: tuple[str, ...]
+
+
+@dataclass
+class EndpointTransferOperation:
+    endpoint_ref_key: str
+    held_resource_kinds: tuple[str, ...]
+    accepting_new_work: bool = True
+    launched: bool = False
+    work_handles: tuple[object, ...] = ()
+    work_terminal: bool = False
+    completion_event: object | None = None
+    completion_event_recorded: bool = False
+    cuda_visibility_terminal: bool = False
+    data_complete: bool = False
+
+
+class EndpointTransferRegistry:
+    """Track transport termination separately from resource ownership.
+
+    Terminal states fence writers; generic finalize releases held resources.
+    """
+
+    def __init__(self):
+        self._operations: dict[str, EndpointTransferOperation] = {}
+
+    def register(
+        self, endpoint_ref_key: str, *, resource_kinds: tuple[str, ...]
+    ) -> EndpointTransferOperation:
+        kinds = tuple(sorted(set(resource_kinds)))
+        existing = self._operations.get(endpoint_ref_key)
+        if existing is not None:
+            if existing.held_resource_kinds != kinds:
+                raise ValueError("endpoint transfer ref reused with different resources")
+            return existing
+        operation = EndpointTransferOperation(endpoint_ref_key, kinds)
+        self._operations[endpoint_ref_key] = operation
+        return operation
+
+    def mark_launched(
+        self,
+        endpoint_ref_key: str,
+        work_handles: list[object],
+        completion_event: object,
+    ) -> None:
+        operation = self._operations[endpoint_ref_key]
+        if not operation.accepting_new_work:
+            raise ValueError("fenced endpoint cannot launch new work")
+        operation.launched = True
+        operation.work_handles = tuple(work_handles)
+        operation.completion_event = completion_event
+
+    def mark_completion_event_recorded(self, endpoint_ref_key: str) -> None:
+        operation = self._operations[endpoint_ref_key]
+        if operation.completion_event is None:
+            raise ValueError("endpoint transfer has no completion event")
+        if not operation.work_terminal:
+            raise ValueError("endpoint transfer Work handles are not terminal")
+        operation.completion_event_recorded = True
+
+    def mark_work_terminal(self, endpoint_ref_key: str) -> None:
+        """Latch successful ``Work.wait`` completion as monotonic authority."""
+
+        operation = self._operations[endpoint_ref_key]
+        if not operation.launched or not operation.work_handles:
+            raise ValueError("endpoint transfer has no launched Work handles")
+        operation.work_terminal = True
+
+    def mark_data_complete(self, endpoint_ref_key: str) -> None:
+        operation = self._operations[endpoint_ref_key]
+        if not operation.completion_event_recorded:
+            raise ValueError("endpoint transfer completion event was not recorded")
+        operation.data_complete = True
+
+    def abort(self, endpoint_ref_key: str) -> EndpointFenceSnapshot:
+        operation = self._operations[endpoint_ref_key]
+        operation.accepting_new_work = False
+        return self.status(endpoint_ref_key)
+
+    def status(self, endpoint_ref_key: str) -> EndpointFenceSnapshot:
+        operation = self._operations[endpoint_ref_key]
+        if not operation.launched and not operation.accepting_new_work:
+            status = EndpointFenceStatus.FENCED
+            work_terminal = True
+            cuda_terminal = True
+        else:
+            work_terminal = operation.work_terminal
+            if operation.completion_event_recorded \
+                    and not operation.cuda_visibility_terminal \
+                    and operation.completion_event is not None \
+                    and operation.completion_event.query():
+                operation.cuda_visibility_terminal = True
+            cuda_terminal = operation.cuda_visibility_terminal
+            if work_terminal and cuda_terminal:
+                status = (
+                    EndpointFenceStatus.COMPLETED
+                    if operation.data_complete else EndpointFenceStatus.FENCED
+                )
+            else:
+                status = EndpointFenceStatus.UNKNOWN
+        return EndpointFenceSnapshot(
+            endpoint_ref_key=endpoint_ref_key,
+            status=status,
+            work_terminal=work_terminal,
+            cuda_visibility_terminal=cuda_terminal,
+            resources_held=bool(operation.held_resource_kinds),
+            held_resource_kinds=operation.held_resource_kinds,
+        )
 
 
 @dataclass

@@ -35,6 +35,7 @@ class PrefixOperation:
     status: PrefixOperationStatus = PrefixOperationStatus.PREPARED
     sequence: Sequence | None = None
     created_at: float = 0.0
+    resources_held: bool = True
 
 
 class PrefixCacheService:
@@ -138,6 +139,7 @@ class PrefixCacheService:
         kv_compatibility_id: str,
         request_context_digest: str,
         cached_prefix_tokens: int,
+        transfer_proven: bool = False,
     ) -> Sequence:
         operation = self._operations[operation_id]
         if operation.status == PrefixOperationStatus.COMMITTED:
@@ -148,16 +150,23 @@ class PrefixCacheService:
         if operation.mode == "local_reuse":
             blocks = self.block_manager.commit_pinned_prefix(operation_id)
         else:
-            if self.transfers.status(operation_id) != MappedTransferStatus.COMPLETED:
+            if not transfer_proven and self.transfers.status(operation_id) != MappedTransferStatus.COMPLETED:
                 raise ValueError("mapped transfer is not complete")
             blocks = operation.dst_block_ids
+            # The final request block may be partial.  It owns real KV bytes
+            # for decode but cannot become a reusable prefix location until a
+            # complete token block exists.
+            reusable = min(
+                len(blocks), len(operation.token_ids) // self.block_manager.block_size
+            )
             self.block_manager.install_prefix_metadata(
-                blocks, operation.token_ids,
+                blocks[:reusable], operation.token_ids,
                 namespace=namespace,
                 kv_compatibility_id=kv_compatibility_id,
                 request_context_digest=request_context_digest,
             )
         sequence = Sequence(operation.token_ids, operation.sampling_params)
+        sequence.defer_deallocation = True
         sequence.block_table = list(blocks)
         sequence.num_cached_tokens = cached_prefix_tokens
         sequence.status = SequenceStatus.WAITING
@@ -173,11 +182,7 @@ class PrefixCacheService:
             return operation.status
         if operation.status == PrefixOperationStatus.ABORTED:
             return operation.status
-        if operation.mode == "remote_transfer":
-            for block_id in operation.dst_block_ids:
-                self.block_manager.release_block(block_id)
-        else:
-            self.block_manager.unpin_prefix(operation_id)
+        # Abort fences the writer but retains owned resources for generic finalize.
         operation.status = PrefixOperationStatus.ABORTED
         return operation.status
 
@@ -192,8 +197,9 @@ class PrefixCacheService:
         with self.block_manager._prefix_state_lock:
             pins = len(self.block_manager._transfer_pins)
         pending = sum(
-            operation.status == PrefixOperationStatus.PREPARED
+            operation.resources_held
             and operation.mode == "remote_transfer"
+            and operation.sequence is None
             and bool(operation.dst_block_ids)
             for operation in self._operations.values()
         )
@@ -224,7 +230,55 @@ class PrefixCacheService:
         if operation.status != PrefixOperationStatus.COMMITTED \
                 or operation.sequence is None:
             return False
-        self.block_manager.deallocate(operation.sequence)
         operation.sequence.status = SequenceStatus.ABORTED
         operation.status = PrefixOperationStatus.ABORTED
         return True
+
+    def finalize_release(
+        self, operation_id: str, resource_kinds: tuple[str, ...]
+    ) -> dict[str, int]:
+        """Release held resources after the first successful generic finalize."""
+        operation = self._operations.get(operation_id)
+        requested = set(resource_kinds)
+        released: dict[str, int] = {}
+        if operation is None:
+            if requested == {"SOURCE_PIN"}:
+                released["SOURCE_PIN"] = int(
+                    self.block_manager.unpin_prefix(operation_id)
+                )
+                return released
+            raise ValueError("unknown prefix operation")
+        if operation.status not in {
+            PrefixOperationStatus.ABORTED, PrefixOperationStatus.COMMITTED,
+        }:
+            raise ValueError("prefix operation is not terminal")
+        if not operation.resources_held:
+            raise ValueError("prefix resources already released")
+        if operation.mode == "remote_transfer" and operation.sequence is None:
+            if requested != {"TARGET_PENDING"}:
+                raise ValueError("pending prefix owns TARGET_PENDING only")
+            for block_id in operation.dst_block_ids:
+                self.block_manager.release_block(block_id)
+            released["TARGET_PENDING"] = len(operation.dst_block_ids)
+        elif operation.sequence is not None:
+            if requested != {"TARGET_SEQUENCE"}:
+                raise ValueError("committed prefix owns TARGET_SEQUENCE only")
+            block_count = len(operation.sequence.block_table)
+            self.block_manager.deallocate(operation.sequence)
+            operation.sequence.defer_deallocation = False
+            released["TARGET_SEQUENCE"] = block_count
+        else:
+            if requested != {"SOURCE_PIN"}:
+                raise ValueError("local prefix owns SOURCE_PIN only")
+            released["SOURCE_PIN"] = int(
+                self.block_manager.unpin_prefix(operation_id)
+            )
+        operation.resources_held = False
+        return released
+
+    def prune_operations(self, operation_ids: set[str]) -> None:
+        self._operations = {
+            operation_id: operation
+            for operation_id, operation in self._operations.items()
+            if operation_id in operation_ids
+        }

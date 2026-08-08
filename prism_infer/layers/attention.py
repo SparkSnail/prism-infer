@@ -3,7 +3,19 @@ from torch import nn
 import triton
 import triton.language as tl
 
+try:
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+except ImportError:
+    flash_attn_varlen_func = None
+    flash_attn_with_kvcache = None
+
 from prism_infer.utils.context import get_context
+
+
+def _require_flash_attention():
+    if flash_attn_varlen_func is None or flash_attn_with_kvcache is None:
+        raise RuntimeError("Attention execution requires flash-attn")
+    return flash_attn_varlen_func, flash_attn_with_kvcache
 
 
 @triton.jit
@@ -56,10 +68,7 @@ class Attention(nn.Module):
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        # Imported lazily: flash-attn requires CUDA and is only needed at forward
-        # time, so importing this module on CPU (unit tests / CI) does not require
-        # flash-attn to be installed.
-        from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+        prefill_attention, decode_attention = _require_flash_attention()
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
@@ -67,12 +76,12 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
-                                       max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                       max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+            o = prefill_attention(q, k, v,
+                                  max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
+                                  max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
+                                  softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+            o = decode_attention(q.unsqueeze(1), k_cache, v_cache,
+                                 cache_seqlens=context.context_lens, block_table=context.block_tables,
+                                 softmax_scale=self.scale, causal=True)
         return o

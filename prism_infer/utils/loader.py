@@ -100,8 +100,8 @@ def load_weights_zerocopy(safetensors_path: str, weight_name: str,
         if weight_name not in f.keys():
             raise KeyError(f"{weight_name!r} not found in {safetensors_path}")
         host = f.get_tensor(weight_name)
-        if not host.is_pinned() and torch.cuda.is_available():
+        copy_to_cuda = param.device.type == "cuda"
+        if copy_to_cuda and not host.is_pinned():
             host = host.pin_memory()
-        # non_blocking: DMA runs in background, CPU returns immediately.
         param.data.copy_(host.view(param.data.dtype).reshape(param.data.shape),
-                         non_blocking=True)
+                         non_blocking=copy_to_cuda)

@@ -5,8 +5,8 @@
 <h3 align="center">A minimal LLM inference engine</h3>
 
 <p align="center">
-  <a href="#features"><b>Features</b></a> ·
-  <a href="#installation"><b>Installation</b></a> ·
+  <a href="#features"><b>Features</b></a> |
+  <a href="#installation"><b>Installation</b></a> |
   <a href="#quick-start"><b>Quick Start</b></a>
 </p>
 
@@ -18,9 +18,9 @@
 
 **prism-infer** is a minimal LLM inference engine focused on getting single-instance inference **correct, fast, and memory-efficient**: KV cache management, two-phase scheduling, and Qwen3 MoE/Dense forward.
 
-It started as a fork of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) and extends it with battle-tested **scheduling / state / fault-tolerance** mechanisms at the inference engine layer.
+It started as a fork of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) and extends it with **scheduling / state / failure-handling and fencing** mechanisms at the inference engine layer.
 
-## Features  
+## Features
 
 - [x] **PagedAttention**: fixed-size KV blocks, prefix caching via rolling hash
 - [x] **Two-phase scheduling**: prefill + decode continuous batching with preemption
@@ -28,10 +28,10 @@ It started as a fork of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)
 - [x] **Expert parallelism**: all-to-all dispatch/combine for MoE across multiple GPUs
 - [x] **CUDA graph**: capture for decode, Torch compilation for fused ops
 - [x] **KV cache LRU + CPU offload**: access-order eviction, pinned CPU pool, recall on prefix hit
-- [x] **Qwen3 Dense** forward: GQA + QK-norm + RoPE (θ=1e6)
+- [x] **Qwen3 Dense** forward: GQA + QK-norm + RoPE (`theta=1e6`)
 - [x] **Qwen3-MoE** forward: router top-k of N + SwiGLU experts with re-norm
 - [x] **PD disaggregation**: prefill-only / decode-only engine modes, KV transfer via NCCL P2P
-- [x] **KV snapshot & live migration**: aligned/unaligned/incremental snapshots, three-way handshake, watchdog
+- [x] **KV snapshot and migration primitives**: aligned/unaligned/incremental helpers, three-way handshake, watchdog
 
 ## Installation
 
@@ -100,6 +100,12 @@ PRISM_MODEL=~/models/Qwen3-0.6B python example.py
 
 prism-infer supports **prefill-decode disaggregation**: the prefill and decode phases run in separate processes, with KV cache transferred between them via NCCL P2P.
 
+### Experimental 2P2D snapshot
+
+The multi-node worker and control-plane path is experimental, not production-ready. A frozen two-node, four-GPU 2P2D campaign executed all 35 test slots: 31 passed, 3 failed, and 1 was blocked. Four of five semantic evidence packets passed; final cleanup failed.
+
+Gateway restart remains a known limitation. One decode worker exited with `SIGSEGV` (exit 139), and tunnel recovery failed while port `18080` remained bound. Both issues are unresolved in this snapshot.
+
 ### Single-node (two GPUs)
 
 ```bash
@@ -139,7 +145,7 @@ python -m prism_infer.engine.pd_runner \
     --mode unified --model ~/models/Qwen3-0.6B
 ```
 
-Greedy output (`temperature=0`) from PD mode matches unified mode token-for-token.
+The parity test checks whether greedy output (`temperature=0`) from PD mode matches unified mode token-for-token.
 
 ## Testing
 
@@ -152,7 +158,6 @@ python -m pytest tests/ -q
 
 The CPU suite covers scheduling, block management, KV transfer, KV snapshot/migration,
 PD connector logic, distributed context, and tensor/expert parallel math.
-Currently: 122 passed, 4 skipped.
 
 **E2E Parity Tests**
 

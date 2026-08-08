@@ -32,6 +32,9 @@ class Scheduler:
         # prefill
         while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.waiting[0]
+            if seq.status == SequenceStatus.ABORTED:
+                self.waiting.popleft()
+                continue
             remaining = self.max_num_batched_tokens - num_batched_tokens
             if remaining == 0:
                 break
@@ -46,6 +49,8 @@ class Scheduler:
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
+            elif not self.block_manager.try_allocate_missing(seq):
+                break
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
@@ -62,6 +67,9 @@ class Scheduler:
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
 
+            if seq.status == SequenceStatus.ABORTED:
+                continue
+
             # Source KV must remain frozen until local migration finish or abort.
             if seq.status == SequenceStatus.MIGRATING_OUT:
                 self.running.append(seq)
@@ -73,7 +81,8 @@ class Scheduler:
             # prefill-only mode: on_prefill_done marks seq FINISHED before decode step.
             # Clean up blocks and skip.
             if seq.status == SequenceStatus.FINISHED:
-                self.block_manager.deallocate(seq)
+                if not seq.defer_deallocation:
+                    self.block_manager.deallocate(seq)
                 continue
 
             # KV readiness gate: KV_TRANSFERRING sequences wait until KV arrives.
@@ -120,5 +129,6 @@ class Scheduler:
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
+                if not seq.defer_deallocation:
+                    self.block_manager.deallocate(seq)
                 self.running.remove(seq)

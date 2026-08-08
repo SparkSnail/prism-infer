@@ -51,6 +51,64 @@ def test_chunked_prefill_of_first_request(small_block):
     assert a.status == SequenceStatus.WAITING   # prefill not finished yet
     assert a in sch.waiting
 
+
+def test_partial_prefix_suffix_allocates_complete_block_table(monkeypatch):
+    monkeypatch.setattr(Sequence, "block_size", 256)
+    sch = make_scheduler(
+        num_blocks=8, block_size=256, max_num_batched_tokens=1024
+    )
+    cached_owner = Sequence(list(range(512)))
+    sch.block_manager.allocate(cached_owner, 0)
+    seq = Sequence(list(range(769)))
+    seq.block_table = cached_owner.block_table
+    cached_owner.block_table = []
+    seq.num_cached_tokens = 512
+    seq.defer_deallocation = True
+    sch.add(seq)
+    free_before = len(sch.block_manager.free_block_ids)
+
+    seqs, is_prefill = sch.schedule()
+
+    assert seqs == [seq]
+    assert is_prefill is True
+    assert seq.num_scheduled_tokens == 257
+    assert len(seq.block_table) == seq.num_blocks == 4
+    assert len(set(seq.block_table)) == 4
+    assert len(sch.block_manager.free_block_ids) == free_before - 2
+    assert set(seq.block_table) <= sch.block_manager.used_block_ids
+    sch.block_manager.deallocate(seq)
+    assert sch.block_manager.used_block_ids == set()
+    assert len(sch.block_manager.free_block_ids) == 8
+
+
+def test_partial_prefix_suffix_capacity_failure_has_zero_allocation_side_effect(
+    monkeypatch,
+):
+    monkeypatch.setattr(Sequence, "block_size", 256)
+    sch = make_scheduler(
+        num_blocks=3, block_size=256, max_num_batched_tokens=1024
+    )
+    cached_owner = Sequence(list(range(512)))
+    sch.block_manager.allocate(cached_owner, 0)
+    seq = Sequence(list(range(769)))
+    seq.block_table = cached_owner.block_table
+    cached_owner.block_table = []
+    seq.num_cached_tokens = 512
+    sch.add(seq)
+    table_before = list(seq.block_table)
+    free_before = tuple(sch.block_manager.free_block_ids)
+    used_before = set(sch.block_manager.used_block_ids)
+    refs_before = [block.ref_count for block in sch.block_manager.blocks]
+
+    assert sch.schedule() == ([], False)
+
+    assert seq in sch.waiting
+    assert seq.num_scheduled_tokens == 0
+    assert seq.block_table == table_before
+    assert tuple(sch.block_manager.free_block_ids) == free_before
+    assert sch.block_manager.used_block_ids == used_before
+    assert [block.ref_count for block in sch.block_manager.blocks] == refs_before
+
 def test_decode_step_after_prefill(small_block):
     sch = make_scheduler(max_num_batched_tokens=8)
     a = Sequence([1, 2, 3, 4])
@@ -171,6 +229,7 @@ def test_postprocess_finishes_on_eos(small_block):
     sch.postprocess(seqs, [0], is_prefill)             # token 0 == eos
     assert a.is_finished is True
     assert a.status == SequenceStatus.FINISHED
+    assert a.block_table == []
     assert sch.is_finished() is True                   # both queues empty
 
 
@@ -182,6 +241,22 @@ def test_postprocess_finishes_on_max_tokens(small_block):
     sch.postprocess(seqs, [7], is_prefill)             # 1 completion token == max_tokens
     assert a.is_finished is True
     assert a.status == SequenceStatus.FINISHED
+
+
+def test_remote_owned_finished_sequence_waits_for_finalize_deallocation(small_block):
+    sch = make_scheduler(eos=0)
+    seq = Sequence([1, 2, 3])
+    seq.defer_deallocation = True
+    sch.add(seq)
+    seqs, is_prefill = sch.schedule()
+    owned_blocks = tuple(seq.block_table)
+
+    sch.postprocess(seqs, [0], is_prefill)
+
+    assert seq.status == SequenceStatus.FINISHED
+    assert tuple(seq.block_table) == owned_blocks
+    assert set(owned_blocks) <= sch.block_manager.used_block_ids
+    sch.block_manager.deallocate(seq)
 
 def test_kv_ready_fn_default_is_none(small_block):
     """_kv_ready_fn defaults to None (unified mode -- no gate applied)."""
@@ -286,3 +361,19 @@ def test_kv_skip_counter_resets_after_ready_sequence(small_block):
     assert is_prefill is False
     assert seqs == ready
     assert all(seq in sch.running for seq in blocked)
+
+
+def test_scheduler_discards_aborted_waiting_and_running_without_gpu_work(small_block):
+    sch = make_scheduler()
+    waiting = Sequence([1, 2, 3, 4])
+    running = Sequence([5, 6, 7, 8])
+    waiting.status = SequenceStatus.ABORTED
+    running.status = SequenceStatus.ABORTED
+    sch.waiting.append(waiting)
+    sch.running.append(running)
+
+    seqs, is_prefill = sch.schedule()
+
+    assert seqs == []
+    assert is_prefill is False
+    assert sch.is_finished()

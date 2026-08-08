@@ -14,6 +14,14 @@ from prism_infer.utils.context import set_context, get_context, reset_context
 from prism_infer.utils.loader import load_model
 
 
+def _hf_config_dtype(hf_config: object) -> torch.dtype:
+    dtype = getattr(hf_config, "dtype", None)
+    if dtype is None:
+        dtype = getattr(hf_config, "torch_dtype", None)
+    assert isinstance(dtype, torch.dtype), f"invalid model dtype: {dtype!r}"
+    return dtype
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -45,7 +53,8 @@ class ModelRunner:
             set_tp_group(tp_group)
 
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+        self.model_dtype = _hf_config_dtype(hf_config)
+        torch.set_default_dtype(self.model_dtype)
         torch.set_default_device("cuda")
 
         if config.expert_parallel_size > 1:
@@ -136,9 +145,10 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        tp_size = config.tensor_parallel_size
+        num_kv_heads = hf_config.num_key_value_heads // tp_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * self.model_dtype.itemsize
         # Respect an explicit num_kvcache_blocks (>0); per-rank auto-estimation
         # from mem_get_info is unstable under concurrent TP init.
         if config.num_kvcache_blocks <= 0:

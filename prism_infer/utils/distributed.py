@@ -1,11 +1,75 @@
-from __future__ import annotations
-
 import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
 import torch.distributed as dist
+
+
+PAIR_GROUP_RANKS: tuple[tuple[str, tuple[int, int]], ...] = (
+    ("p0--d0", (0, 2)),
+    ("p0--d1", (0, 3)),
+    ("p1--d0", (1, 2)),
+    ("p1--d1", (1, 3)),
+    ("d0--d1", (2, 3)),
+)
+
+
+@dataclass
+class PairGroup:
+    pair_id: str
+    global_ranks: tuple[int, int]
+    process_group: object
+    warmed_up: bool = False
+
+
+class PairGroupRegistry:
+
+    def __init__(self, *, global_rank: int):
+        self.global_rank = global_rank
+        self._groups: dict[str, PairGroup] = {}
+        self._probe_attestations: dict[str, dict[str, object]] = {}
+
+    def create_all(self) -> None:
+        assert not self._groups, "pair groups may only be created once at startup"
+        for pair_id, ranks in PAIR_GROUP_RANKS:
+            group = dist.new_group(ranks=list(ranks), backend="nccl")
+            self._groups[pair_id] = PairGroup(pair_id, ranks, group)
+
+    def pair(self, pair_id: str) -> PairGroup:
+        try:
+            return self._groups[pair_id]
+        except KeyError as exc:
+            raise ValueError(f"unknown or uninitialized pair: {pair_id}") from exc
+
+    def group_peer(self, pair_id: str, global_rank: int | None = None) -> int:
+        pair = self.pair(pair_id)
+        rank = self.global_rank if global_rank is None else global_rank
+        if rank not in pair.global_ranks:
+            raise ValueError(f"global rank {rank} is not a member of {pair_id}")
+        return 1 - pair.global_ranks.index(rank)
+
+    def global_peer(self, pair_id: str, global_rank: int | None = None) -> int:
+        pair = self.pair(pair_id)
+        rank = self.global_rank if global_rank is None else global_rank
+        if rank not in pair.global_ranks:
+            raise ValueError(f"global rank {rank} is not a member of {pair_id}")
+        return pair.global_ranks[1 - pair.global_ranks.index(rank)]
+
+    def mark_warmed_up(self, pair_id: str) -> None:
+        self.pair(pair_id).warmed_up = True
+
+    def ready(self, pair_id: str) -> bool:
+        return self.pair(pair_id).warmed_up
+
+    def record_probe_attestation(self, pair_id: str, attestation: dict[str, object]) -> None:
+        if attestation.get("pair_id") != pair_id:
+            raise ValueError("probe attestation pair mismatch")
+        self._probe_attestations[pair_id] = dict(attestation)
+
+    def probe_attestation(self, pair_id: str) -> dict[str, object] | None:
+        value = self._probe_attestations.get(pair_id)
+        return dict(value) if value is not None else None
 
 
 @dataclass

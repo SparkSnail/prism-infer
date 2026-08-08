@@ -289,6 +289,29 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 
+    def try_allocate_missing(self, seq: Sequence) -> bool:
+        """Allocate an uncached suffix without partially mutating ownership."""
+        with self._prefix_state_lock:
+            missing = seq.num_blocks - len(seq.block_table)
+            assert missing >= 0, (
+                "block table exceeds sequence demand: "
+                f"owned={len(seq.block_table)}, required={seq.num_blocks}"
+            )
+            if self._num_available() < missing:
+                return False
+
+            allocated: list[int] = []
+            try:
+                for _ in range(missing):
+                    allocated.append(self._allocate_block())
+            except KeyError:
+                # Preserve all-or-nothing allocation if allocator state is inconsistent.
+                for block_id in reversed(allocated):
+                    self.release_block(block_id)
+                return False
+            seq.block_table.extend(allocated)
+            return True
+
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]

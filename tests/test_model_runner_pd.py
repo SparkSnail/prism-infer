@@ -38,10 +38,10 @@ def _fake_hf_config():
     return cfg
 
 
-def _make_config(rank_for_port=0) -> SimpleNamespace:
+def _make_config(rank_for_port=0, hf_config=None) -> SimpleNamespace:
     return SimpleNamespace(
         model="/fake/model",
-        hf_config=_fake_hf_config(),
+        hf_config=hf_config or _fake_hf_config(),
         kvcache_block_size=256,
         enforce_eager=True,
         tensor_parallel_size=1,
@@ -79,7 +79,11 @@ PATCHES = [
 ]
 
 
-def _build_runner_mocked(gpu_rank: int, dist_already_init: bool = False):
+def _build_runner_mocked(
+    gpu_rank: int,
+    dist_already_init: bool = False,
+    hf_config=None,
+):
     """Construct a ModelRunner with all GPU/dist calls mocked.
 
     Args:
@@ -93,7 +97,7 @@ def _build_runner_mocked(gpu_rank: int, dist_already_init: bool = False):
     """
     from prism_infer.engine.model_runner import ModelRunner
 
-    config = _make_config()
+    config = _make_config(hf_config=hf_config)
     mock_ctx = {}
 
     with patch("prism_infer.engine.model_runner.dist.is_initialized",
@@ -102,7 +106,7 @@ def _build_runner_mocked(gpu_rank: int, dist_already_init: bool = False):
          patch("prism_infer.engine.model_runner.torch.cuda.set_device"), \
          patch("prism_infer.engine.model_runner.torch.cuda.device_count",
                return_value=2), \
-         patch("prism_infer.engine.model_runner.torch.set_default_dtype"), \
+         patch("prism_infer.engine.model_runner.torch.set_default_dtype") as m_set_default_dtype, \
          patch("prism_infer.engine.model_runner.torch.set_default_device"), \
          patch("prism_infer.engine.model_runner.torch.get_default_dtype",
                return_value=torch.float32), \
@@ -129,6 +133,7 @@ def _build_runner_mocked(gpu_rank: int, dist_already_init: bool = False):
             ModelRunner.__init__(runner, config, gpu_rank, [])
 
         mock_ctx["init_process_group"] = m_ipg
+        mock_ctx["set_default_dtype"] = m_set_default_dtype
 
     return runner, mock_ctx
 
@@ -206,3 +211,51 @@ def test_pd_standalone_rank_override_is_idempotent_for_rank0():
     # Both must end up with rank=0, world_size=1
     assert runner0.rank == runner1.rank == 0
     assert runner0.world_size == runner1.world_size == 1
+
+
+def test_model_runner_accepts_torch_dtype_only_hf_config():
+    hf_config = _fake_hf_config()
+    del hf_config.dtype
+    hf_config.torch_dtype = torch.float16
+
+    runner, ctx = _build_runner_mocked(gpu_rank=0, hf_config=hf_config)
+
+    assert runner.model_dtype is torch.float16
+    assert ctx["set_default_dtype"].call_args_list[0] == call(torch.float16)
+
+
+def test_allocate_kv_cache_uses_resolved_model_dtype():
+    from prism_infer.engine.model_runner import ModelRunner
+
+    hf_config = _fake_hf_config()
+    del hf_config.dtype
+    hf_config.torch_dtype = torch.float16
+    config = _make_config(hf_config=hf_config)
+    config.num_kvcache_blocks = 0
+    config.gpu_memory_utilization = 1.0
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.config = config
+    runner.block_size = 4
+    runner.model_dtype = torch.float16
+    runner.model = MagicMock()
+    runner.model.modules.return_value = []
+    total_bytes = 1024 * 1024
+
+    with patch(
+        "prism_infer.engine.model_runner.torch.cuda.mem_get_info",
+        return_value=(total_bytes, total_bytes),
+    ), patch(
+        "prism_infer.engine.model_runner.torch.cuda.memory_stats",
+        return_value={
+            "allocated_bytes.all.peak": 0,
+            "allocated_bytes.all.current": 0,
+        },
+    ), patch(
+        "prism_infer.engine.model_runner.torch.empty",
+        return_value=MagicMock(),
+    ):
+        runner.allocate_kv_cache()
+
+    block_bytes = 2 * 2 * 4 * 4 * 64 * torch.float16.itemsize
+    assert config.num_kvcache_blocks == total_bytes // block_bytes
