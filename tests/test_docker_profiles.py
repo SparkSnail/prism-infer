@@ -109,7 +109,7 @@ def test_image_variant_arg_is_global_and_resolves_both_named_stages():
         ),
         (
             "profile-performance",
-            "FROM profile-${PRISM_IMAGE_VARIANT} AS selected-profile",
+            "FROM profile-${PRISM_IMAGE_VARIANT} AS model-download",
             FIXED_QWEN3_8B_BF16_TP1_PROFILE,
             "performance",
         ),
@@ -134,3 +134,73 @@ def test_runtime_image_exposes_profile_provenance_labels():
         "ai.sparksnail.prism.kv.compatibility-id",
     ):
         assert key in text
+
+
+def test_download_stage_is_separate_from_variant_model_layers():
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    assert "FROM profile-${PRISM_IMAGE_VARIANT} AS model-download" in text
+    assert "FROM model-files-${PRISM_IMAGE_VARIANT} AS selected-profile" in text
+    assert text.count("from huggingface_hub import snapshot_download") == 1
+    assert 'revision=os.environ["PRISM_MODEL_REVISION"]' in text
+    assert 'expected = os.environ["PRISM_MODEL_CONFIG_SHA256"]' in text
+
+
+def test_performance_model_has_one_copy_layer_per_weight_shard():
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    block = text.split("FROM profile-performance AS model-files-performance", 1)[1]
+    block = block.split(
+        "FROM model-files-${PRISM_IMAGE_VARIANT} AS selected-profile", 1
+    )[0]
+
+    shards = [f"model-{index:05d}-of-00005.safetensors" for index in range(1, 6)]
+    copy_lines = [
+        line.strip()
+        for line in block.splitlines()
+        if line.strip().startswith("COPY --link --from=model-download")
+    ]
+    weight_copy_lines = [line for line in copy_lines if ".safetensors" in line]
+
+    assert weight_copy_lines == [
+        "COPY --link --from=model-download "
+        f"/opt/models/Qwen3-8B/{shard} /opt/models/Qwen3-8B/"
+        for shard in shards
+    ]
+    for name in (
+        ".prism-model-revision",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+    ):
+        assert f"/opt/models/Qwen3-8B/{name}" in block
+
+
+def test_correctness_model_keeps_one_complete_weight_layer():
+    text = DOCKERFILE.read_text(encoding="utf-8")
+    block = text.split("FROM profile-correctness AS model-files-correctness", 1)[1]
+    block = block.split("FROM profile-performance AS model-files-performance", 1)[0]
+    weight_copy_lines = [
+        line.strip()
+        for line in block.splitlines()
+        if line.strip().startswith("COPY --link --from=model-download")
+        and ".safetensors" in line
+    ]
+
+    assert weight_copy_lines == [
+        "COPY --link --from=model-download "
+        "/opt/models/Qwen3-0.6B/model.safetensors /opt/models/Qwen3-0.6B/"
+    ]
+    for name in (
+        ".prism-model-revision",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+    ):
+        assert f"/opt/models/Qwen3-0.6B/{name}" in block

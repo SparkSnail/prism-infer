@@ -81,7 +81,7 @@ ENV PRISM_IMAGE_VARIANT=performance \
     PRISM_GPU_MEMORY_UTILIZATION=0.9 \
     PRISM_ENFORCE_EAGER=false
 
-FROM profile-${PRISM_IMAGE_VARIANT} AS selected-profile
+FROM profile-${PRISM_IMAGE_VARIANT} AS model-download
 
 # Workers load the same pinned snapshot from the image and never contact the
 # Hub during Pod startup.
@@ -123,6 +123,39 @@ if not (target / "model.safetensors").is_file() and not (
     os.environ["PRISM_MODEL_REVISION"] + "\n", encoding="utf-8"
 )
 PY
+
+# The download stage remains the content authority. Each original weight shard
+# becomes a separate image layer so registries can upload the shards in parallel.
+FROM profile-correctness AS model-files-correctness
+COPY --link --from=model-download \
+    /opt/models/Qwen3-0.6B/.prism-model-revision \
+    /opt/models/Qwen3-0.6B/config.json \
+    /opt/models/Qwen3-0.6B/generation_config.json \
+    /opt/models/Qwen3-0.6B/merges.txt \
+    /opt/models/Qwen3-0.6B/tokenizer.json \
+    /opt/models/Qwen3-0.6B/tokenizer_config.json \
+    /opt/models/Qwen3-0.6B/vocab.json \
+    /opt/models/Qwen3-0.6B/
+COPY --link --from=model-download /opt/models/Qwen3-0.6B/model.safetensors /opt/models/Qwen3-0.6B/
+
+FROM profile-performance AS model-files-performance
+COPY --link --from=model-download \
+    /opt/models/Qwen3-8B/.prism-model-revision \
+    /opt/models/Qwen3-8B/config.json \
+    /opt/models/Qwen3-8B/generation_config.json \
+    /opt/models/Qwen3-8B/merges.txt \
+    /opt/models/Qwen3-8B/model.safetensors.index.json \
+    /opt/models/Qwen3-8B/tokenizer.json \
+    /opt/models/Qwen3-8B/tokenizer_config.json \
+    /opt/models/Qwen3-8B/vocab.json \
+    /opt/models/Qwen3-8B/
+COPY --link --from=model-download /opt/models/Qwen3-8B/model-00001-of-00005.safetensors /opt/models/Qwen3-8B/
+COPY --link --from=model-download /opt/models/Qwen3-8B/model-00002-of-00005.safetensors /opt/models/Qwen3-8B/
+COPY --link --from=model-download /opt/models/Qwen3-8B/model-00003-of-00005.safetensors /opt/models/Qwen3-8B/
+COPY --link --from=model-download /opt/models/Qwen3-8B/model-00004-of-00005.safetensors /opt/models/Qwen3-8B/
+COPY --link --from=model-download /opt/models/Qwen3-8B/model-00005-of-00005.safetensors /opt/models/Qwen3-8B/
+
+FROM model-files-${PRISM_IMAGE_VARIANT} AS selected-profile
 
 COPY pyproject.toml README.md LICENSE ./
 COPY prism_infer ./prism_infer
