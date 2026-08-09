@@ -807,15 +807,14 @@ def main() -> None:
         instance_epoch=instance_epoch,
         topology_generation=topology_generation,
     )
+    engine_kwargs = (
+        model_profile.engine_kwargs() if model_profile is not None else {}
+    )
     config = Config(
-        model=_required("PRISM_MODEL"), engine_mode="unified",
+        model=_required("PRISM_MODEL"),
+        engine_mode="unified",
         instance_id=instance_id,
-        tensor_parallel_size=(
-            model_profile.tensor_parallel_size if model_profile is not None else 1
-        ),
-        kvcache_block_size=(
-            model_profile.tokens_per_block if model_profile is not None else 256
-        ),
+        **engine_kwargs,
     )
     engine = LLMEngine(config)
     engine.scheduler.block_manager.instance_epoch = instance_epoch

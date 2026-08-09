@@ -1,11 +1,13 @@
-"""Validate a fixed model profile before CUDA or NCCL initialization."""
+"""Validate immutable model profiles before CUDA or NCCL initialization."""
 
 from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
+from types import MappingProxyType
 
 
 class ModelProfileError(RuntimeError):
@@ -20,7 +22,7 @@ def calculate_kv_block_bytes(
     head_dim: int,
     dtype_bytes: int,
 ) -> int:
-    """Return the physical byte size of one full K/V block."""
+    """Return the physical byte size of one full TP=1 K/V block."""
     values = {
         "num_hidden_layers": num_hidden_layers,
         "tokens_per_block": tokens_per_block,
@@ -30,7 +32,6 @@ def calculate_kv_block_bytes(
     }
     if any(value <= 0 for value in values.values()):
         raise ValueError(f"KV block dimensions must be positive: {values!r}")
-    # The leading factor accounts for separate K and V tensors.
     return (
         2
         * num_hidden_layers
@@ -57,6 +58,11 @@ class FixedModelProfile:
     num_key_value_heads: int
     head_dim: int
     rope_theta: float
+    max_model_len: int
+    max_num_batched_tokens: int
+    max_num_seqs: int
+    gpu_memory_utilization: float
+    enforce_eager: bool
 
     @property
     def kv_block_bytes(self) -> int:
@@ -69,7 +75,7 @@ class FixedModelProfile:
         )
 
     def compatibility_fields(self) -> dict[str, object]:
-        """Return all canonical fields used for KV compatibility."""
+        """Return the canonical fields used for KV compatibility."""
         return {
             "schema_version": 1,
             "model_id": self.model_id,
@@ -94,11 +100,36 @@ class FixedModelProfile:
         ).encode()
         return hashlib.sha256(encoded).hexdigest()
 
+    def runtime_fields(self) -> dict[str, object]:
+        """Return runtime limits fixed by this profile."""
+        return {
+            "max_model_len": self.max_model_len,
+            "max_num_batched_tokens": self.max_num_batched_tokens,
+            "max_num_seqs": self.max_num_seqs,
+            "gpu_memory_utilization": self.gpu_memory_utilization,
+            "enforce_eager": self.enforce_eager,
+        }
+
+    def engine_kwargs(self, *, enforce_eager: bool | None = None) -> dict[str, object]:
+        """Return shared Config/LLM keyword arguments for this profile."""
+        return {
+            "tensor_parallel_size": self.tensor_parallel_size,
+            "kvcache_block_size": self.tokens_per_block,
+            "max_model_len": self.max_model_len,
+            "max_num_batched_tokens": self.max_num_batched_tokens,
+            "max_num_seqs": self.max_num_seqs,
+            "gpu_memory_utilization": self.gpu_memory_utilization,
+            "enforce_eager": (
+                self.enforce_eager if enforce_eager is None else enforce_eager
+            ),
+        }
+
     def as_resource_report(self) -> dict[str, object]:
         return {
             "profile_id": self.profile_id,
             **self.compatibility_fields(),
             "kv_compatibility_id": self.kv_compatibility_id,
+            **self.runtime_fields(),
         }
 
 
@@ -117,13 +148,48 @@ FIXED_QWEN3_0_6B_PROFILE = FixedModelProfile(
     num_key_value_heads=8,
     head_dim=128,
     rope_theta=1_000_000.0,
+    max_model_len=4096,
+    max_num_batched_tokens=16384,
+    max_num_seqs=512,
+    gpu_memory_utilization=0.9,
+    enforce_eager=False,
+)
+
+FIXED_QWEN3_8B_BF16_TP1_PROFILE = FixedModelProfile(
+    profile_id="qwen3-8b-bf16-tp1",
+    model_id="Qwen/Qwen3-8B",
+    model_revision="b968826d9c46dd6066d109eabc6255188de91218",
+    tokenizer_revision="b968826d9c46dd6066d109eabc6255188de91218",
+    config_sha256="f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30",
+    dtype="bfloat16",
+    dtype_bytes=2,
+    tensor_parallel_size=1,
+    tokens_per_block=256,
+    kv_layout="NHDC",
+    num_hidden_layers=36,
+    num_key_value_heads=8,
+    head_dim=128,
+    rope_theta=1_000_000.0,
+    max_model_len=4096,
+    max_num_batched_tokens=16384,
+    max_num_seqs=128,
+    gpu_memory_utilization=0.9,
+    enforce_eager=False,
+)
+
+FIXED_MODEL_PROFILES: Mapping[str, FixedModelProfile] = MappingProxyType(
+    {
+        FIXED_QWEN3_0_6B_PROFILE.profile_id: FIXED_QWEN3_0_6B_PROFILE,
+        FIXED_QWEN3_8B_BF16_TP1_PROFILE.profile_id:
+            FIXED_QWEN3_8B_BF16_TP1_PROFILE,
+    }
 )
 
 
 def _required(environ: Mapping[str, str], name: str) -> str:
     value = environ.get(name)
     if value is None or not value.strip():
-        raise ModelProfileError(f"missing required 2P2D model environment: {name}")
+        raise ModelProfileError(f"missing required model profile environment: {name}")
     return value.strip()
 
 
@@ -148,6 +214,31 @@ def _require_int(
     if actual != expected:
         raise ModelProfileError(
             f"{name} mismatch: expected {expected}, got {actual}"
+        )
+
+
+def _require_float(
+    environ: Mapping[str, str], name: str, expected: float
+) -> None:
+    raw = _required(environ, name)
+    try:
+        actual = float(raw)
+    except ValueError as exc:
+        raise ModelProfileError(f"{name} must be a float, got {raw!r}") from exc
+    if not math.isfinite(actual) or actual != expected:
+        raise ModelProfileError(
+            f"{name} mismatch: expected {expected}, got {raw!r}"
+        )
+
+
+def _require_bool(
+    environ: Mapping[str, str], name: str, expected: bool
+) -> None:
+    raw = _required(environ, name)
+    expected_raw = str(expected).lower()
+    if raw not in {"true", "false"} or raw != expected_raw:
+        raise ModelProfileError(
+            f"{name} mismatch: expected {expected_raw!r}, got {raw!r}"
         )
 
 
@@ -185,8 +276,7 @@ def _load_and_verify_config(
             raise ModelProfileError(
                 f"config.json {key} mismatch: expected {expected!r}, got {actual!r}"
             )
-    architectures = value.get("architectures")
-    if architectures != ["Qwen3ForCausalLM"]:
+    if value.get("architectures") != ["Qwen3ForCausalLM"]:
         raise ModelProfileError(
             "config.json architectures must be exactly ['Qwen3ForCausalLM']"
         )
@@ -196,36 +286,61 @@ def _load_and_verify_config(
 def preflight_model_profile(
     environ: Mapping[str, str] | None = None,
     *,
-    profile: FixedModelProfile = FIXED_QWEN3_0_6B_PROFILE,
+    profile: FixedModelProfile | None = None,
 ) -> FixedModelProfile | None:
     """Validate an opt-in profile, or return None for generic model mode."""
     values = os.environ if environ is None else environ
     enabled_profile = values.get("PRISM_MODEL_PROFILE")
     if enabled_profile is None or not enabled_profile.strip():
         return None
-    if enabled_profile.strip() != profile.profile_id:
+    profile_id = enabled_profile.strip()
+    selected = profile
+    if selected is None:
+        selected = FIXED_MODEL_PROFILES.get(profile_id)
+        if selected is None:
+            raise ModelProfileError(
+                f"unsupported PRISM_MODEL_PROFILE: {profile_id!r}"
+            )
+    elif profile_id != selected.profile_id:
         raise ModelProfileError(
-            "unsupported PRISM_MODEL_PROFILE: "
-            f"expected {profile.profile_id!r}, got {enabled_profile.strip()!r}"
+            "PRISM_MODEL_PROFILE mismatch: "
+            f"expected {selected.profile_id!r}, got {profile_id!r}"
         )
 
-    _require_exact(values, "PRISM_MODEL_ID", profile.model_id)
-    _require_exact(values, "PRISM_MODEL_REVISION", profile.model_revision)
-    _require_exact(values, "PRISM_TOKENIZER_REVISION", profile.tokenizer_revision)
-    _require_exact(values, "PRISM_MODEL_CONFIG_SHA256", profile.config_sha256)
-    _require_exact(values, "PRISM_DTYPE", profile.dtype)
-    _require_exact(values, "PRISM_KV_LAYOUT", profile.kv_layout)
+    _require_exact(values, "PRISM_MODEL_ID", selected.model_id)
+    _require_exact(values, "PRISM_MODEL_REVISION", selected.model_revision)
+    _require_exact(values, "PRISM_TOKENIZER_REVISION", selected.tokenizer_revision)
+    _require_exact(values, "PRISM_MODEL_CONFIG_SHA256", selected.config_sha256)
+    _require_exact(values, "PRISM_DTYPE", selected.dtype)
+    _require_exact(values, "PRISM_KV_LAYOUT", selected.kv_layout)
     _require_exact(
-        values, "PRISM_KV_COMPATIBILITY_ID", profile.kv_compatibility_id
+        values, "PRISM_KV_COMPATIBILITY_ID", selected.kv_compatibility_id
     )
-    _require_int(values, "PRISM_TP_SIZE", profile.tensor_parallel_size)
-    _require_int(values, "PRISM_TOKENS_PER_BLOCK", profile.tokens_per_block)
-    _require_int(values, "PRISM_KV_BLOCK_BYTES", profile.kv_block_bytes)
+    _require_int(values, "PRISM_TP_SIZE", selected.tensor_parallel_size)
+    _require_int(values, "PRISM_TOKENS_PER_BLOCK", selected.tokens_per_block)
+    _require_int(values, "PRISM_KV_BLOCK_BYTES", selected.kv_block_bytes)
+    _require_int(
+        values, "PRISM_MODEL_NUM_HIDDEN_LAYERS", selected.num_hidden_layers
+    )
+    _require_int(
+        values, "PRISM_MODEL_NUM_KEY_VALUE_HEADS", selected.num_key_value_heads
+    )
+    _require_int(values, "PRISM_MODEL_HEAD_DIM", selected.head_dim)
+    _require_float(values, "PRISM_MODEL_ROPE_THETA", selected.rope_theta)
+    _require_int(values, "PRISM_MAX_MODEL_LEN", selected.max_model_len)
+    _require_int(
+        values, "PRISM_MAX_NUM_BATCHED_TOKENS", selected.max_num_batched_tokens
+    )
+    _require_int(values, "PRISM_MAX_NUM_SEQS", selected.max_num_seqs)
+    _require_float(
+        values, "PRISM_GPU_MEMORY_UTILIZATION", selected.gpu_memory_utilization
+    )
+    _require_bool(values, "PRISM_ENFORCE_EAGER", selected.enforce_eager)
 
     model_dir = Path(_required(values, "PRISM_MODEL")).expanduser()
     if not model_dir.is_dir():
         raise ModelProfileError(f"PRISM_MODEL is not a directory: {model_dir}")
-    _load_and_verify_config(model_dir, profile)
+    _load_and_verify_config(model_dir, selected)
     if not (model_dir / "tokenizer.json").is_file() \
             or not (model_dir / "tokenizer_config.json").is_file():
         raise ModelProfileError(
@@ -234,4 +349,4 @@ def preflight_model_profile(
     if not (model_dir / "model.safetensors").is_file() \
             and not (model_dir / "model.safetensors.index.json").is_file():
         raise ModelProfileError("pinned model snapshot has no safetensors weights")
-    return profile
+    return selected
