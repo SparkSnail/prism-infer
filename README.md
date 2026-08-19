@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="#features"><b>Features</b></a> |
+  <a href="#multi-node-performance-snapshot"><b>Performance</b></a> |
   <a href="#installation"><b>Installation</b></a> |
   <a href="#quick-start"><b>Quick Start</b></a>
 </p>
@@ -105,6 +106,22 @@ prism-infer supports **prefill-decode disaggregation**: the prefill and decode p
 The multi-node worker and control-plane path is experimental, not production-ready. A frozen two-node, four-GPU 2P2D campaign executed all 35 test slots: 31 passed, 3 failed, and 1 was blocked. Four of five semantic evidence packets passed; final cleanup failed.
 
 Gateway restart remains a known limitation. One decode worker exited with `SIGSEGV` (exit 139), and tunnel recovery failed while port `18080` remained bound. Both issues are unresolved in this snapshot.
+
+### Multi-node performance snapshot
+
+The 2026-08-18 ACK absolute baseline used 2 nodes and 4 NVIDIA L20 GPUs with
+Qwen3-8B BF16, TP=1, fixed 2P2D, affinity disabled, and `NCCL_SOCKET`.
+At concurrency 50 with 769 input and 32 output tokens, 300/300 warm-up and
+750/750 measured requests passed. TTFT p50/p95/p99 was
+6,921.109/9,615.555/10,908.582 ms; TPOT was 27.199/29.338/31.013 ms;
+inter-chunk latency was 22.795/84.418/139.210 ms; and end-to-end latency was
+7,790.814/10,505.132/11,755.448 ms. Throughput was 6.005 successful requests/s
+and 192.152 successful output tokens/s. GPU utilization, memory, and power
+mean/p95 were 54.664/92.000%, 39,931/40,008 MiB, and 165.540/225.330 W.
+
+This is an absolute `PERF_OFF` baseline. The `PERF_ON` comparison is `NOT_RUN`,
+so no optimization gain is claimed. See the
+[full benchmark table](https://github.com/SparkSnail/prism-serve#performance-snapshot).
 
 ### Single-node (two GPUs)
 
