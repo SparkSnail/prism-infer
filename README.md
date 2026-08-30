@@ -5,10 +5,12 @@
 <h3 align="center">A minimal LLM inference engine</h3>
 
 <p align="center">
-  <a href="#features"><b>Features</b></a> |
-  <a href="#multi-node-performance-snapshot"><b>Performance</b></a> |
-  <a href="#installation"><b>Installation</b></a> |
-  <a href="#quick-start"><b>Quick Start</b></a>
+  <a href="#features"><b>Features</b></a> &middot;
+  <a href="#performance-snapshot"><b>Performance</b></a> &middot;
+  <a href="#installation"><b>Installation</b></a> &middot;
+  <a href="#quick-start"><b>Quick Start</b></a> &middot;
+  <a href="#testing"><b>Testing</b></a> &middot;
+  <a href="#benchmark"><b>Benchmark</b></a>
 </p>
 
 <p align="center">
@@ -21,18 +23,44 @@
 
 It started as a fork of [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) and extends it with **scheduling / state / failure-handling and fencing** mechanisms at the inference engine layer.
 
+In multi-node deployments, `prism-infer` provides the GPU workers that execute prefill and decode and own the KV-cache runtime. [prism-serve](https://github.com/SparkSnail/prism-serve) provides the Kubernetes Gateway and control plane that coordinates those workers.
+
 ## Features
 
-- [x] **PagedAttention**: fixed-size KV blocks, prefix caching via rolling hash
-- [x] **Two-phase scheduling**: prefill + decode continuous batching with preemption
-- [x] **Tensor parallelism**: column/row-parallel linear, fused QKV / gate-up projections
-- [x] **Expert parallelism**: all-to-all dispatch/combine for MoE across multiple GPUs
-- [x] **CUDA graph**: capture for decode, Torch compilation for fused ops
-- [x] **KV cache LRU + CPU offload**: access-order eviction, pinned CPU pool, recall on prefix hit
-- [x] **Qwen3 Dense** forward: GQA + QK-norm + RoPE (`theta=1e6`)
-- [x] **Qwen3-MoE** forward: router top-k of N + SwiGLU experts with re-norm
-- [x] **PD disaggregation**: prefill-only / decode-only engine modes, KV transfer via NCCL P2P
-- [x] **KV snapshot and migration primitives**: aligned/unaligned/incremental helpers, three-way handshake, watchdog
+- **PagedAttention**: fixed-size KV blocks, prefix caching via rolling hash
+- **Two-phase scheduling**: prefill + decode continuous batching with preemption
+- **Tensor parallelism**: column/row-parallel linear, fused QKV / gate-up projections
+- **Expert parallelism**: all-to-all dispatch/combine for MoE across multiple GPUs
+- **CUDA graph**: capture for decode, Torch compilation for fused ops
+- **KV cache LRU + CPU offload**: access-order eviction, pinned CPU pool, recall on prefix hit
+- **Qwen3 Dense** forward: GQA + QK-norm + RoPE (`theta=1e6`)
+- **Qwen3-MoE** forward: router top-k of N + SwiGLU experts with re-norm
+- **PD disaggregation**: prefill-only / decode-only engine modes, KV transfer via NCCL P2P
+- **KV snapshot and migration primitives**: aligned/unaligned/incremental helpers, three-way handshake, watchdog
+
+## Performance Snapshot
+
+This paired 2P2D snapshot measures the end-to-end Prism stack, not an isolated benchmark of either repository. `prism-serve` applies optional prefix-affinity routing and coordinates the `prism-infer` prefill/decode workers. On the same model, hardware, topology, request mix, and concurrency, affinity lowers time-to-first-token and end-to-end latency while increasing completed-request throughput. The table keeps the decode trade-off visible instead of presenting a single best-case number. This is a controlled paired benchmark for the fixed 2P2D setup, not a production SLO.
+
+**Headline:** With affinity enabled, TTFT p50 is 64.9% lower, E2E p50 is 33.4% lower, and successful request throughput is 35.1% higher on this workload. TPOT rises, so this is a workload-specific prefix-reuse result, not a blanket speedup.
+
+| Benchmark setup | Value |
+|---|---|
+| Model | Qwen3-8B, BF16 |
+| Hardware | 2 nodes, 4 NVIDIA L20 GPUs |
+| Parallelism | fixed 2P2D, TP=1 |
+| Workload | 512 shared + 257 unique input tokens; 32 output tokens |
+| Concurrency | 50 |
+| Sampling | streaming; 3 repetitions of 100 warm-up + 250 measured requests (1,050 total per configuration) |
+| Transport | NCCL Socket |
+
+| Metric | Affinity OFF (baseline) | Affinity ON | Change vs OFF |
+|---|---:|---:|---:|
+| TTFT p50 / p95 / p99 (ms) | 6,527.661 / 9,975.492 / 10,729.448 | 2,293.325 / 4,305.316 / 5,522.773 | 64.868% / 56.841% / 48.527% lower |
+| TPOT p50 / p95 / p99 (ms) | 25.798 / 29.938 / 31.989 | 81.959 / 145.253 / 151.019 | 217.696% / 385.173% / 372.103% higher |
+| E2E p50 / p95 / p99 (ms) | 7,387.104 / 10,750.170 / 11,610.063 | 4,916.720 / 5,442.772 / 5,581.826 | 33.442% / 49.370% / 51.923% lower |
+| Successful requests/s | 6.274584 | 8.475600 | 35.078% higher |
+| Successful output tokens/s | 200.7867 | 271.2192 | 35.078% higher |
 
 ## Installation
 
@@ -46,8 +74,7 @@ Runtime support:
 prism-infer needs an NVIDIA CUDA GPU plus a matching PyTorch and `flash-attn`.
 
 1. **PyTorch** install the build matching your CUDA version, see [pytorch.org/get-started](https://pytorch.org/get-started/locally/).
-2. **flash-attn** CUDA-only, and **not** installed by `pip install -e .` 
- Pick one:
+2. **flash-attn** is CUDA-only and is not installed by `pip install -e .`. Choose one:
    - *Prebuilt wheel (recommended, fast):* download the wheel matching your torch / CUDA / Python / C++ ABI from the [flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases), then `pip install <downloaded-wheel>.whl`.
    - *From source (needs CUDA toolkit / `nvcc`):* `pip install flash-attn --no-build-isolation`.
 
@@ -97,73 +124,6 @@ PRISM_MODEL=~/models/Qwen3-0.6B python example.py
 
 `example.py` read the model directory from the `PRISM_MODEL` env var (a local model folder; defaults to `~/models/Qwen3-0.6B/`).
 
-## PD Disaggregation
-
-prism-infer supports **prefill-decode disaggregation**: the prefill and decode phases run in separate processes, with KV cache transferred between them via NCCL P2P.
-
-### Experimental 2P2D snapshot
-
-The multi-node worker and control-plane path is experimental, not production-ready. A frozen two-node, four-GPU 2P2D campaign executed all 35 test slots: 31 passed, 3 failed, and 1 was blocked. Four of five semantic evidence packets passed; final cleanup failed.
-
-Gateway restart remains a known limitation. One decode worker exited with `SIGSEGV` (exit 139), and tunnel recovery failed while port `18080` remained bound. Both issues are unresolved in this snapshot.
-
-### Multi-node performance snapshot
-
-The 2026-08-18 ACK absolute baseline used 2 nodes and 4 NVIDIA L20 GPUs with
-Qwen3-8B BF16, TP=1, fixed 2P2D, affinity disabled, and `NCCL_SOCKET`.
-At concurrency 50 with 769 input and 32 output tokens, 300/300 warm-up and
-750/750 measured requests passed. TTFT p50/p95/p99 was
-6,921.109/9,615.555/10,908.582 ms; TPOT was 27.199/29.338/31.013 ms;
-inter-chunk latency was 22.795/84.418/139.210 ms; and end-to-end latency was
-7,790.814/10,505.132/11,755.448 ms. Throughput was 6.005 successful requests/s
-and 192.152 successful output tokens/s. GPU utilization, memory, and power
-mean/p95 were 54.664/92.000%, 39,931/40,008 MiB, and 165.540/225.330 W.
-
-This is an absolute `PERF_OFF` baseline. The `PERF_ON` comparison is `NOT_RUN`,
-so no optimization gain is claimed. See the
-[full benchmark table](https://github.com/SparkSnail/prism-serve#performance-snapshot).
-
-### Single-node (two GPUs)
-
-```bash
-# Terminal 1: prefill process (GPU 0)
-CUDA_VISIBLE_DEVICES=0 python -m prism_infer.engine.pd_runner \
-    --mode prefill-only --model ~/models/Qwen3-0.6B \
-    --master-addr localhost --master-port 29500 \
-    --world-size 2 --rank 0
-
-# Terminal 2: decode process (GPU 1)
-CUDA_VISIBLE_DEVICES=1 python -m prism_infer.engine.pd_runner \
-    --mode decode-only --model ~/models/Qwen3-0.6B \
-    --master-addr localhost --master-port 29500 \
-    --world-size 2 --rank 1
-```
-
-### Multi-node
-
-```bash
-# Node A (rank 0, prefill)
-NCCL_SOCKET_IFNAME=eth0 python -m prism_infer.engine.pd_runner \
-    --mode prefill-only --model /shared/Qwen3-0.6B \
-    --master-addr <node-A-ip> --master-port 29500 \
-    --world-size 2 --rank 0
-
-# Node B (rank 1, decode)
-NCCL_SOCKET_IFNAME=eth0 python -m prism_infer.engine.pd_runner \
-    --mode decode-only --model /shared/Qwen3-0.6B \
-    --master-addr <node-A-ip> --master-port 29500 \
-    --world-size 2 --rank 1
-```
-
-### Unified baseline (parity check)
-
-```bash
-python -m prism_infer.engine.pd_runner \
-    --mode unified --model ~/models/Qwen3-0.6B
-```
-
-The parity test checks whether greedy output (`temperature=0`) from PD mode matches unified mode token-for-token.
-
 ## Testing
 
 **Unit tests run on CPU.**
@@ -173,8 +133,7 @@ pip install -e ".[test]"
 python -m pytest tests/ -q
 ```
 
-The CPU suite covers scheduling, block management, KV transfer, KV snapshot/migration,
-PD connector logic, distributed context, and tensor/expert parallel math.
+The CPU suite covers scheduling, block management, KV transfer, KV snapshot/migration, PD connector logic, distributed context, and tensor/expert parallel math.
 
 **E2E Parity Tests**
 
