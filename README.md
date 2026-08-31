@@ -160,7 +160,13 @@ PRISM_TEST_MOE_MODEL=~/models/Qwen3-30B-A3B python -m pytest tests/test_parity_e
 
 `bench/bench.py` measures **TTFT**, **prefill throughput**, **decode TPS**, and a **throughput-vs-batch-size** curve, for both Dense and MoE models.
 
-More details refer [bench/README.md](bench/README.md).
+Pass `--model` (or set `PRISM_MODEL`) and use `--seed`, `--repetitions`, and
+`--output path.json` for reproducible runtime reports. The separate
+`bench/tp_parity.py` script is a TP correctness diagnostic, not a performance
+benchmark.
+
+See the [benchmark guide](bench/README.md) for command examples, metric
+definitions, structured output, and multi-GPU notes.
 
 ## License
 

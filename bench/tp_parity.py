@@ -40,8 +40,9 @@ def run_worker(args) -> None:
         gpu_memory_utilization=0.4,
     )
 
-    # temperature=1e-6 makes Gumbel-max behave like argmax (logit dominates noise),
-    # so the first token is effectively greedy and comparable across processes.
+    # A very low temperature makes Gumbel-max near-greedy while retaining the
+    # same sampling path in both workers. This is a smoke test, not a proof of
+    # parity for every prompt or sampling configuration.
     sp = SamplingParams(temperature=1e-6, ignore_eos=True, max_tokens=args.max_tokens)
     out = llm.generate([args.prompt], sp, use_tqdm=False)[0]
     print("PARITY_JSON " + json.dumps({"token_ids": out["token_ids"], "text": out["text"]}))
@@ -122,16 +123,17 @@ def run_driver(args) -> None:
 
     print("\n---------------- verdict ----------------")
     if all_full_ok:
-        print("PASS: all TP degrees produce identical token streams.")
+        print("PASS: token streams matched for this prompt and configuration.")
+        print("      This does not prove parity for all prompts or workloads.")
     elif all_first_ok:
-        print("LIKELY-OK: first token matches everywhere -> TP forward is correct.")
-        print("           Later divergence is sampling noise (Gumbel-max, not argmax)")
-        print("           and/or BF16 multi-step error amplification, NOT a TP bug.")
-        print("           Action: tighten with greedy or accept for throughput bench.")
+        print("INCONCLUSIVE: first token matched for this prompt and TP set.")
+        print("              Later divergence may come from sampling noise or BF16")
+        print("              multi-step error amplification; inspect logits before")
+        print("              drawing a general correctness conclusion.")
     else:
-        print("FAIL: first token already differs -> REAL tensor-parallel bug.")
-        print("      Suspect all_reduce (o_proj/down_proj), head split, or vocab gather.")
-        print("      Next: single-step last-token logits parity, layer by layer.")
+        print("MISMATCH: first token differs for this prompt and TP set.")
+        print("          Investigate all_reduce (o_proj/down_proj), head split,")
+        print("          vocab gather, and single-step logits before assigning a cause.")
     print("=========================================")
 
 
