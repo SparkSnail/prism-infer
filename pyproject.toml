@@ -12,15 +12,17 @@ readme = "README.md"
 description = "LLM inference engine, a fork of nano-vllm with extensions (MoE, PD disaggregation, EP, etc.)"
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "fastapi>=0.110",
-    "httpx>=0.27",
-    "nats-py>=2.7",
-    "pydantic>=2.6",
-    "torch>=2.4.0",
-    "triton>=3.0.0",
-    "transformers>=4.51.0",
-    "uvicorn[standard]>=0.29",
-    "xxhash",
+    "fastapi>=0.110,<1",
+    "httpx>=0.27,<1",
+    "nats-py>=2.7,<3",
+    "numpy>=1.24,<3",
+    "pydantic>=2.6,<3",
+    "safetensors>=0.4,<1",
+    "torch>=2.4,<2.7",
+    "tqdm>=4.66,<5",
+    "transformers>=4.51,<5",
+    "uvicorn[standard]>=0.29,<1",
+    "xxhash>=3,<4",
 ]
 
 [project.optional-dependencies]
@@ -28,9 +30,13 @@ test = [
     "pytest>=7.0",
     "pytest-asyncio>=0.23",
 ]
-# flash-attn needs CUDA and is best installed from a prebuilt wheel (see README);
-# kept optional so CPU-only installs / CI do not try to build it from source.
-gpu = ["flash-attn"]
+# Triton and flash-attn are Linux/CUDA-only. Keep them out of the default
+# install so CPU-side control-plane tests and tooling remain installable.
+# flash-attn is best installed from a matching prebuilt wheel (see README).
+gpu = [
+    "triton>=3,<3.3; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "flash-attn>=2.7.4,<3; platform_system == 'Linux' and platform_machine == 'x86_64'",
+]
 
 [project.urls]
 Homepage="https://github.com/SparkSnail/prism-infer"

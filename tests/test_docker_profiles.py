@@ -109,7 +109,7 @@ def test_image_variant_arg_is_global_and_resolves_both_named_stages():
         ),
         (
             "profile-performance",
-            "FROM profile-${PRISM_IMAGE_VARIANT} AS model-download",
+            "FROM profile-${PRISM_IMAGE_VARIANT} AS model-staging",
             FIXED_QWEN3_8B_BF16_TP1_PROFILE,
             "performance",
         ),
@@ -126,6 +126,16 @@ def test_named_stage_contains_one_coherent_profile_bundle(
 def test_runtime_image_exposes_profile_provenance_labels():
     text = DOCKERFILE.read_text(encoding="utf-8")
 
+    assert "ARG GIT_SHA=unknown" in text
+    assert "ARG PRISM_RELEASE=false" in text
+    assert "PRISM_RELEASE=true requires a full lowercase commit SHA" in text
+    assert "USER prism" in text
+    assert "adduser --system --uid 10001" in text
+    assert "HOME=/var/run/prism" in text
+    assert "TRITON_HOME=/var/run/prism/triton" in text
+    assert "XDG_CACHE_HOME=/var/run/prism/.cache" in text
+    assert "/var/run/prism/triton /var/run/prism/.cache" in text
+    assert "chown -R prism:prism /var/run/prism" in text
     for key in (
         "ai.sparksnail.prism.image.variant",
         "ai.sparksnail.prism.model.profile",
@@ -136,14 +146,46 @@ def test_runtime_image_exposes_profile_provenance_labels():
         assert key in text
 
 
-def test_download_stage_is_separate_from_variant_model_layers():
+def test_model_staging_uses_only_the_local_named_context():
     text = DOCKERFILE.read_text(encoding="utf-8")
 
-    assert "FROM profile-${PRISM_IMAGE_VARIANT} AS model-download" in text
+    assert "FROM profile-${PRISM_IMAGE_VARIANT} AS model-staging" in text
     assert "FROM model-files-${PRISM_IMAGE_VARIANT} AS selected-profile" in text
-    assert text.count("from huggingface_hub import snapshot_download") == 1
-    assert 'revision=os.environ["PRISM_MODEL_REVISION"]' in text
-    assert 'expected = os.environ["PRISM_MODEL_CONFIG_SHA256"]' in text
+    assert "snapshot_download" not in text
+    assert "huggingface_hub" not in text
+    assert (
+        "--mount=type=bind,from=model-cache,source=.,target=/mnt/model-cache,ro"
+        in text
+    )
+    assert "model-cache must be a model directory" in text
+    assert 'expected_revision = os.environ["PRISM_MODEL_REVISION"]' in text
+    assert 'expected_config_sha = os.environ["PRISM_MODEL_CONFIG_SHA256"]' in text
+    assert 'model-cache is missing .prism-model-manifest.json' in text
+    assert '"prism.local_model_cache/v1"' in text
+    assert "file hash mismatch" in text
+    assert "model-cache is missing .prism-model-revision" in text
+    assert ".prism-model-manifest.json" in text
+    assert "write_text" not in text.split("FROM profile-${PRISM_IMAGE_VARIANT} AS model-staging", 1)[1].split("PY", 1)[0]
+    assert (DOCKERFILE.parent / "scripts" / "create_model_cache_manifest.py").is_file()
+
+
+def test_docker_installs_all_direct_runtime_dependencies():
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    for requirement in (
+        '"numpy==2.2.6"',
+        '"safetensors==0.5.3"',
+        '"tqdm==4.67.1"',
+    ):
+        assert requirement in text
+
+
+def test_docker_readme_documents_required_model_context():
+    readme = (DOCKERFILE.parent / "README.md").read_text(encoding="utf-8")
+
+    assert "--build-context model-cache=" in readme
+    assert "no model download occurs during the image build" in readme
+    assert "Qwen3-8B" in readme
 
 
 def test_performance_model_has_one_copy_layer_per_weight_shard():
@@ -157,12 +199,12 @@ def test_performance_model_has_one_copy_layer_per_weight_shard():
     copy_lines = [
         line.strip()
         for line in block.splitlines()
-        if line.strip().startswith("COPY --link --from=model-download")
+        if line.strip().startswith("COPY --link --from=model-staging")
     ]
     weight_copy_lines = [line for line in copy_lines if ".safetensors" in line]
 
     assert weight_copy_lines == [
-        "COPY --link --from=model-download "
+        "COPY --link --from=model-staging "
         f"/opt/models/Qwen3-8B/{shard} /opt/models/Qwen3-8B/"
         for shard in shards
     ]
@@ -186,12 +228,12 @@ def test_correctness_model_keeps_one_complete_weight_layer():
     weight_copy_lines = [
         line.strip()
         for line in block.splitlines()
-        if line.strip().startswith("COPY --link --from=model-download")
+        if line.strip().startswith("COPY --link --from=model-staging")
         and ".safetensors" in line
     ]
 
     assert weight_copy_lines == [
-        "COPY --link --from=model-download "
+        "COPY --link --from=model-staging "
         "/opt/models/Qwen3-0.6B/model.safetensors /opt/models/Qwen3-0.6B/"
     ]
     for name in (

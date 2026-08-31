@@ -38,9 +38,16 @@ In multi-node deployments, `prism-infer` provides the GPU workers that execute p
 - **PD disaggregation**: prefill-only / decode-only engine modes, KV transfer via NCCL P2P
 - **KV snapshot and migration primitives**: aligned/unaligned/incremental helpers, three-way handshake, watchdog
 
-## Performance Snapshot
+## Reference Performance Snapshot
 
-This paired 2P2D snapshot measures the end-to-end Prism stack, not an isolated benchmark of either repository. `prism-serve` applies optional prefix-affinity routing and coordinates the `prism-infer` prefill/decode workers. On the same model, hardware, topology, request mix, and concurrency, affinity lowers time-to-first-token and end-to-end latency while increasing completed-request throughput. The table keeps the decode trade-off visible instead of presenting a single best-case number. This is a controlled paired benchmark for the fixed 2P2D setup, not a production SLO.
+This immutable historical reference measures the end-to-end Prism stack, not
+an isolated benchmark of either repository. `prism-serve` applies optional
+prefix-affinity routing and coordinates the `prism-infer` prefill/decode
+workers. On the recorded model, hardware, topology, request mix, and
+concurrency, affinity lowered time-to-first-token and end-to-end latency while
+increasing completed-request throughput. The table keeps the decode trade-off
+visible. It is a controlled paired benchmark for the fixed 2P2D setup, not a
+production SLO or a claim about the current working tree.
 
 **Headline:** With affinity enabled, TTFT p50 is 64.9% lower, E2E p50 is 33.4% lower, and successful request throughput is 35.1% higher on this workload. TPOT rises, so this is a workload-specific prefix-reuse result, not a blanket speedup.
 
@@ -62,6 +69,9 @@ This paired 2P2D snapshot measures the end-to-end Prism stack, not an isolated b
 | Successful requests/s | 6.274584 | 8.475600 | 35.078% higher |
 | Successful output tokens/s | 200.7867 | 271.2192 | 35.078% higher |
 
+The immutable result record and input provenance are maintained in the
+companion [`prism-serve` benchmark archive](https://github.com/SparkSnail/prism-serve/tree/main/bench/results).
+
 ## Installation
 
 Runtime support:
@@ -71,12 +81,26 @@ Runtime support:
 
 ### Environment setup (prerequisites)
 
-prism-infer needs an NVIDIA CUDA GPU plus a matching PyTorch and `flash-attn`.
+The package has two install paths:
 
-1. **PyTorch** install the build matching your CUDA version, see [pytorch.org/get-started](https://pytorch.org/get-started/locally/).
-2. **flash-attn** is CUDA-only and is not installed by `pip install -e .`. Choose one:
-   - *Prebuilt wheel (recommended, fast):* download the wheel matching your torch / CUDA / Python / C++ ABI from the [flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases), then `pip install <downloaded-wheel>.whl`.
-   - *From source (needs CUDA toolkit / `nvcc`):* `pip install flash-attn --no-build-isolation`.
+- **CPU/control-plane:** installs the Python runtime needed by tests and worker
+  protocol tooling. It does not execute model attention.
+- **GPU inference:** requires Linux/WSL2, an NVIDIA CUDA runtime, a matching
+  PyTorch/Triton pair, and `flash-attn`.
+
+For the GPU stack, install the package first and then install a FlashAttention
+wheel matching the selected PyTorch/CUDA/Python/C++ ABI from the
+[flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases):
+
+```bash
+pip install -e .
+pip install "triton>=3,<3.3"
+pip install <matching-flash-attn-wheel>.whl
+```
+
+The optional `.[gpu]` extra is available when your package index provides a
+compatible FlashAttention wheel. Installing FlashAttention from source needs a
+CUDA toolkit and `nvcc`, and can take substantially longer.
 
 Verify the environment:
 
@@ -92,10 +116,84 @@ Same commands on Linux and WSL2 (Ubuntu):
 ```bash
 git clone https://github.com/SparkSnail/prism-infer.git
 cd prism-infer
-pip install -e .
+pip install -e ".[test]"
 ```
 
 Windows users: run the commands above inside a WSL2 Ubuntu shell.
+
+### Docker
+
+The Dockerfile builds the pinned Linux/CUDA worker image and embeds model
+provenance. Model files are supplied through a local BuildKit named context;
+no model download occurs during the image build. Pass a parent directory that
+contains the profile directory, or pass the profile directory itself:
+
+```bash
+MODEL_CACHE="$HOME/models"
+docker build \
+  --build-context model-cache="$MODEL_CACHE" \
+  --build-arg PRISM_IMAGE_VARIANT=correctness \
+  --build-arg GIT_SHA="$(git rev-parse HEAD)" \
+  -t prism-infer:local .
+```
+
+For the performance profile, the cache must contain the pinned `Qwen3-8B`
+directory instead:
+
+```bash
+docker build \
+  --build-context model-cache="$HOME/models" \
+  --build-arg PRISM_IMAGE_VARIANT=performance \
+  --build-arg GIT_SHA="$(git rev-parse HEAD)" \
+  -t prism-infer:qwen3-8b .
+```
+
+The staging step checks `config.json`, tokenizer metadata, and every
+safetensors file against the cache's required
+`.prism-model-manifest.json`. The manifest records the model ID, model and
+tokenizer revisions, and SHA-256 for each file; a matching
+`.prism-model-revision` marker is also required. The build never creates a
+marker or silently labels unverified weights as pinned. Create the cache
+identity entirely offline after obtaining the model; this command writes both
+files:
+
+```bash
+python scripts/create_model_cache_manifest.py \
+  --model-dir "$HOME/models/Qwen3-8B" \
+  --model-id Qwen/Qwen3-8B \
+  --revision b968826d9c46dd6066d109eabc6255188de91218 \
+  --tokenizer-revision b968826d9c46dd6066d109eabc6255188de91218 \
+  --config-sha256 f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30
+```
+
+Keep the model cache outside the application build context so model bytes are
+not copied into the source context. A missing or mismatched manifest fails the
+build before any image is produced.
+
+For a published image, set `PRISM_RELEASE=true`; the build then rejects an
+unknown source revision:
+
+```bash
+docker build \
+  --build-context model-cache="$HOME/models" \
+  --build-arg PRISM_IMAGE_VARIANT=correctness \
+  --build-arg PRISM_RELEASE=true \
+  --build-arg GIT_SHA="$(git rev-parse HEAD)" \
+  -t prism-infer:<release> .
+```
+
+### Release tags
+
+The first public container release follows the package version `v0.3.0`:
+
+- `sparksnail/prism-infer:v0.3.0` - the Qwen3-0.6B correctness profile
+- `sparksnail/prism-infer:v0.3.0-qwen3-8b` - the Qwen3-8B performance profile
+
+The model-profile suffix is part of the tag because the images contain
+different pinned model artifacts. Tags are convenient release aliases; pin the
+image digest and matching source commit for a reproducible deployment or a
+paired benchmark. Create the Git release tag `v0.3.0` on the same clean source
+commit used for the image. Do not use `latest`.
 
 ## Model Download
 

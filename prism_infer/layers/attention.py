@@ -1,7 +1,17 @@
 import torch
 from torch import nn
-import triton
-import triton.language as tl
+
+try:
+    import triton
+    import triton.language as tl
+except ImportError as exc:
+    # Triton is a Linux/CUDA-only acceleration dependency. Keep CPU-side
+    # imports usable and report the missing dependency at execution time.
+    triton = None
+    tl = None
+    _TRITON_IMPORT_ERROR = exc
+else:
+    _TRITON_IMPORT_ERROR = None
 
 try:
     from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
@@ -18,30 +28,47 @@ def _require_flash_attention():
     return flash_attn_varlen_func, flash_attn_with_kvcache
 
 
-@triton.jit
-def store_kvcache_kernel(
-    key_ptr,
-    key_stride,
-    value_ptr,
-    value_stride,
-    k_cache_ptr,
-    v_cache_ptr,
-    slot_mapping_ptr,
-    D: tl.constexpr,
-):
-    idx = tl.program_id(0)
-    slot = tl.load(slot_mapping_ptr + idx)
-    if slot == -1: return
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
+if triton is not None:
+
+    @triton.jit
+    def store_kvcache_kernel(
+        key_ptr,
+        key_stride,
+        value_ptr,
+        value_stride,
+        k_cache_ptr,
+        v_cache_ptr,
+        slot_mapping_ptr,
+        D: tl.constexpr,
+    ):
+        idx = tl.program_id(0)
+        slot = tl.load(slot_mapping_ptr + idx)
+        if slot == -1:
+            return
+        key_offsets = idx * key_stride + tl.arange(0, D)
+        value_offsets = idx * value_stride + tl.arange(0, D)
+        key = tl.load(key_ptr + key_offsets)
+        value = tl.load(value_ptr + value_offsets)
+        cache_offsets = slot * D + tl.arange(0, D)
+        tl.store(k_cache_ptr + cache_offsets, key)
+        tl.store(v_cache_ptr + cache_offsets, value)
+else:
+
+    def store_kvcache_kernel(*args, **kwargs):
+        _require_triton()
+
+
+def _require_triton():
+    if triton is None:
+        raise RuntimeError(
+            "KV-cache attention execution requires Triton; install the GPU "
+            "dependencies on Linux/WSL2 or use the Docker image"
+        ) from _TRITON_IMPORT_ERROR
+    return triton
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
+    _require_triton()
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
     assert key.stride(-1) == 1 and value.stride(-1) == 1

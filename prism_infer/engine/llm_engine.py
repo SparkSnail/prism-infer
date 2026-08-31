@@ -4,6 +4,7 @@ import socket
 import uuid
 from dataclasses import fields
 from time import perf_counter
+from typing import TypedDict
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
@@ -13,6 +14,13 @@ from prism_infer.sampling_params import SamplingParams
 from prism_infer.engine.sequence import Sequence
 from prism_infer.engine.scheduler import Scheduler
 from prism_infer.engine.model_runner import ModelRunner
+
+
+class GenerationOutput(TypedDict):
+    """One decoded result returned by :meth:`LLMEngine.generate`."""
+
+    text: str
+    token_ids: list[int]
 
 
 def _find_free_port() -> int:
@@ -163,7 +171,7 @@ class LLMEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
-    ) -> list[str]:
+    ) -> list[GenerationOutput]:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)

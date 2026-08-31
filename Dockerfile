@@ -27,6 +27,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
       "pydantic==2.13.4" \
       "httpx==0.28.1" \
       "nats-py==2.15.0" \
+      "numpy==2.2.6" \
+      "safetensors==0.5.3" \
+      "tqdm==4.67.1" \
       "transformers==4.51.3" \
       "xxhash==3.7.0" \
       "https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-cp311-cp311-linux_x86_64.whl#sha256=58853b28a5a926cae14402bfd8d4d93a45ebf8f9e79533f37ab09d0d77a99c05"
@@ -81,54 +84,139 @@ ENV PRISM_IMAGE_VARIANT=performance \
     PRISM_GPU_MEMORY_UTILIZATION=0.9 \
     PRISM_ENFORCE_EAGER=false
 
-FROM profile-${PRISM_IMAGE_VARIANT} AS model-download
+FROM profile-${PRISM_IMAGE_VARIANT} AS model-staging
 
-# Workers load the same pinned snapshot from the image and never contact the
-# Hub during Pod startup.
-RUN --mount=type=cache,target=/root/.cache/huggingface \
+# ``model-cache`` is a required BuildKit named context. Model bytes are staged
+# from this local context only; the image build never contacts the Hub.
+RUN --mount=type=bind,from=model-cache,source=.,target=/mnt/model-cache,ro \
     python - <<'PY'
 import hashlib
+import json
 import os
+import shutil
 from pathlib import Path
 
-from huggingface_hub import snapshot_download
+cache_root = Path("/mnt/model-cache").resolve()
+model_name = Path(os.environ["PRISM_MODEL"]).name
+candidates = (cache_root / model_name, cache_root)
+source = next(
+    (candidate.resolve() for candidate in candidates if (candidate / "config.json").is_file()),
+    None,
+)
+if source is None:
+    raise SystemExit(
+        "model-cache must be a model directory or contain "
+        f"{model_name}/config.json"
+    )
+try:
+    source.relative_to(cache_root)
+except ValueError as exc:
+    raise SystemExit("model-cache model path must stay inside the named context") from exc
+
+expected_revision = os.environ["PRISM_MODEL_REVISION"]
+expected_tokenizer_revision = os.environ["PRISM_TOKENIZER_REVISION"]
+expected_model_id = os.environ["PRISM_MODEL_ID"]
+revision_marker = source / ".prism-model-revision"
+if revision_marker.is_symlink() or not revision_marker.is_file():
+    raise SystemExit("model-cache is missing .prism-model-revision")
+actual_revision = revision_marker.read_text(encoding="utf-8").strip()
+if actual_revision != expected_revision:
+    raise SystemExit(
+        "model-cache revision mismatch: "
+        f"expected {expected_revision}, got {actual_revision}"
+    )
+
+manifest_path = source / ".prism-model-manifest.json"
+if manifest_path.is_symlink() or not manifest_path.is_file():
+    raise SystemExit("model-cache is missing .prism-model-manifest.json")
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (OSError, ValueError) as exc:
+    raise SystemExit("model-cache manifest is not valid JSON") from exc
+if not isinstance(manifest, dict) or set(manifest) != {
+    "schema_version", "model_id", "revision", "tokenizer_revision",
+    "config_sha256", "files",
+}:
+    raise SystemExit("model-cache manifest has an invalid shape")
+if manifest["schema_version"] != "prism.local_model_cache/v1":
+    raise SystemExit("model-cache manifest schema_version is unsupported")
+if manifest["model_id"] != expected_model_id:
+    raise SystemExit("model-cache manifest model_id mismatch")
+if manifest["revision"] != expected_revision:
+    raise SystemExit("model-cache manifest revision mismatch")
+if manifest["tokenizer_revision"] != expected_tokenizer_revision:
+    raise SystemExit("model-cache manifest tokenizer_revision mismatch")
+expected_config_sha = os.environ["PRISM_MODEL_CONFIG_SHA256"]
+if manifest["config_sha256"] != expected_config_sha:
+    raise SystemExit("model-cache manifest config_sha256 mismatch")
+manifest_files = manifest["files"]
+if not isinstance(manifest_files, dict):
+    raise SystemExit("model-cache manifest files must be an object")
 
 target = Path(os.environ["PRISM_MODEL"])
-snapshot_download(
-    repo_id=os.environ["PRISM_MODEL_ID"],
-    revision=os.environ["PRISM_MODEL_REVISION"],
-    local_dir=target,
-    allow_patterns=[
-        "*.json",
-        "*.safetensors",
-        "*.model",
-        "*.txt",
-        "merges.txt",
-        "vocab.json",
-    ],
+required_files = (
+    "config.json",
+    "generation_config.json",
+    "merges.txt",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
 )
-actual = hashlib.sha256((target / "config.json").read_bytes()).hexdigest()
-expected = os.environ["PRISM_MODEL_CONFIG_SHA256"]
-if actual != expected:
-    raise SystemExit(f"config.json SHA-256 mismatch: expected {expected}, got {actual}")
-if not (target / "tokenizer.json").is_file() or not (
-    target / "tokenizer_config.json"
-).is_file():
-    raise SystemExit("pinned snapshot is missing tokenizer files")
-if not (target / "model.safetensors").is_file() and not (
-    target / "model.safetensors.index.json"
-).is_file():
-    raise SystemExit("pinned snapshot is missing safetensors weights")
-(target / ".prism-model-revision").write_text(
-    os.environ["PRISM_MODEL_REVISION"] + "\n", encoding="utf-8"
-)
+
+def copy_from_cache(relative_path):
+    relative_path = Path(relative_path)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise SystemExit("model-cache manifest contains an unsafe path")
+    source_file = (source / relative_path).resolve()
+    try:
+        source_file.relative_to(cache_root)
+    except ValueError as exc:
+        raise SystemExit("model-cache contains a file outside the named context") from exc
+    if not source_file.is_file():
+        raise SystemExit(f"model-cache is missing required file: {relative_path}")
+    manifest_key = relative_path.as_posix()
+    expected_hash = manifest_files.get(manifest_key)
+    if not isinstance(expected_hash, str) or len(expected_hash) != 64 \
+            or any(character not in "0123456789abcdef" for character in expected_hash):
+        raise SystemExit(f"model-cache manifest is missing {manifest_key}")
+    digest = hashlib.sha256()
+    with source_file.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != expected_hash:
+        raise SystemExit(f"model-cache file hash mismatch: {manifest_key}")
+    destination = target / relative_path
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_file, destination)
+
+for relative_path in required_files:
+    copy_from_cache(relative_path)
+
+index_file = source / "model.safetensors.index.json"
+weight_files = sorted(source.glob("*.safetensors"))
+if index_file.is_file():
+    copy_from_cache(index_file.name)
+if not weight_files:
+    raise SystemExit("model-cache is missing safetensors weights")
+for weight_file in weight_files:
+    copy_from_cache(weight_file.name)
+
+actual_config_sha = hashlib.sha256((target / "config.json").read_bytes()).hexdigest()
+if actual_config_sha != expected_config_sha:
+    raise SystemExit(
+        "config.json SHA-256 mismatch: "
+        f"expected {expected_config_sha}, got {actual_config_sha}"
+    )
+shutil.copy2(revision_marker, target / ".prism-model-revision")
+shutil.copy2(manifest_path, target / ".prism-model-manifest.json")
 PY
 
-# The download stage remains the content authority. Each original weight shard
+# The staging stage remains the content authority. Each original weight shard
 # becomes a separate image layer so registries can upload the shards in parallel.
 FROM profile-correctness AS model-files-correctness
-COPY --link --from=model-download \
+COPY --link --from=model-staging \
     /opt/models/Qwen3-0.6B/.prism-model-revision \
+    /opt/models/Qwen3-0.6B/.prism-model-manifest.json \
     /opt/models/Qwen3-0.6B/config.json \
     /opt/models/Qwen3-0.6B/generation_config.json \
     /opt/models/Qwen3-0.6B/merges.txt \
@@ -136,11 +224,12 @@ COPY --link --from=model-download \
     /opt/models/Qwen3-0.6B/tokenizer_config.json \
     /opt/models/Qwen3-0.6B/vocab.json \
     /opt/models/Qwen3-0.6B/
-COPY --link --from=model-download /opt/models/Qwen3-0.6B/model.safetensors /opt/models/Qwen3-0.6B/
+COPY --link --from=model-staging /opt/models/Qwen3-0.6B/model.safetensors /opt/models/Qwen3-0.6B/
 
 FROM profile-performance AS model-files-performance
-COPY --link --from=model-download \
+COPY --link --from=model-staging \
     /opt/models/Qwen3-8B/.prism-model-revision \
+    /opt/models/Qwen3-8B/.prism-model-manifest.json \
     /opt/models/Qwen3-8B/config.json \
     /opt/models/Qwen3-8B/generation_config.json \
     /opt/models/Qwen3-8B/merges.txt \
@@ -149,25 +238,28 @@ COPY --link --from=model-download \
     /opt/models/Qwen3-8B/tokenizer_config.json \
     /opt/models/Qwen3-8B/vocab.json \
     /opt/models/Qwen3-8B/
-COPY --link --from=model-download /opt/models/Qwen3-8B/model-00001-of-00005.safetensors /opt/models/Qwen3-8B/
-COPY --link --from=model-download /opt/models/Qwen3-8B/model-00002-of-00005.safetensors /opt/models/Qwen3-8B/
-COPY --link --from=model-download /opt/models/Qwen3-8B/model-00003-of-00005.safetensors /opt/models/Qwen3-8B/
-COPY --link --from=model-download /opt/models/Qwen3-8B/model-00004-of-00005.safetensors /opt/models/Qwen3-8B/
-COPY --link --from=model-download /opt/models/Qwen3-8B/model-00005-of-00005.safetensors /opt/models/Qwen3-8B/
+COPY --link --from=model-staging /opt/models/Qwen3-8B/model-00001-of-00005.safetensors /opt/models/Qwen3-8B/
+COPY --link --from=model-staging /opt/models/Qwen3-8B/model-00002-of-00005.safetensors /opt/models/Qwen3-8B/
+COPY --link --from=model-staging /opt/models/Qwen3-8B/model-00003-of-00005.safetensors /opt/models/Qwen3-8B/
+COPY --link --from=model-staging /opt/models/Qwen3-8B/model-00004-of-00005.safetensors /opt/models/Qwen3-8B/
+COPY --link --from=model-staging /opt/models/Qwen3-8B/model-00005-of-00005.safetensors /opt/models/Qwen3-8B/
 
 FROM model-files-${PRISM_IMAGE_VARIANT} AS selected-profile
 
 COPY pyproject.toml README.md LICENSE ./
 COPY prism_infer ./prism_infer
 
-ARG GIT_SHA
+# A source revision is recommended for published images.  ``unknown`` keeps a
+# plain local build usable while making the missing provenance explicit.
+ARG GIT_SHA=unknown
+ARG PRISM_RELEASE=false
 ARG SOURCE_URL=https://github.com/SparkSnail/prism-infer
 
 ENV PRISM_IMAGE_GIT_SHA=${GIT_SHA}
 
-RUN python -c "import re,sys; assert re.fullmatch(r'[0-9a-f]{40}', sys.argv[1]), 'GIT_SHA must be a full lowercase commit SHA'" "${GIT_SHA}" && \
+RUN python -c "import re,sys; sha,release=sys.argv[1:]; valid_sha=bool(re.fullmatch(r'[0-9a-f]{40}', sha)); assert release in ('true','false'), 'PRISM_RELEASE must be true or false'; assert valid_sha or (release == 'false' and sha == 'unknown'), 'release images require a full lowercase commit SHA'; assert not (release == 'true' and sha == 'unknown'), 'PRISM_RELEASE=true requires a full lowercase commit SHA'" "${GIT_SHA}" "${PRISM_RELEASE}" && \
     python -m pip install --no-build-isolation --no-deps . && \
-    python -c "import flash_attn, httpx, torch, triton; from prism_infer.server.process_identity import assert_pidfd_support; from prism_infer.server.unified_baseline import main as baseline_main; from prism_infer.server.worker import main; assert callable(baseline_main); assert_pidfd_support(); print(torch.__version__, torch.version.cuda, triton.__version__, flash_attn.__version__, httpx.__version__)" && \
+    python -c "import flash_attn, httpx, torch, triton; import numpy, safetensors, tqdm; from prism_infer.server.process_identity import assert_pidfd_support; from prism_infer.server.unified_baseline import main as baseline_main; from prism_infer.server.worker import main; assert callable(baseline_main); assert_pidfd_support(); print(torch.__version__, torch.version.cuda, triton.__version__, flash_attn.__version__, httpx.__version__, numpy.__version__, safetensors.__version__, tqdm.__version__)" && \
     mkdir -p /opt/prism/build && \
     python -m pip freeze --all > /tmp/prism-pip-freeze.txt && \
     LC_ALL=C sort /tmp/prism-pip-freeze.txt > /opt/prism/build/pip-freeze.txt && \
@@ -175,6 +267,9 @@ RUN python -c "import re,sys; assert re.fullmatch(r'[0-9a-f]{40}', sys.argv[1]),
 
 ENV HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
+    HOME=/var/run/prism \
+    TRITON_HOME=/var/run/prism/triton \
+    XDG_CACHE_HOME=/var/run/prism/.cache \
     PIP_NO_CACHE_DIR=1
 
 LABEL org.opencontainers.image.source="${SOURCE_URL}" \
@@ -187,6 +282,15 @@ LABEL org.opencontainers.image.source="${SOURCE_URL}" \
       ai.sparksnail.prism.model.tokenizer-revision="${PRISM_TOKENIZER_REVISION}" \
       ai.sparksnail.prism.model.config-sha256="${PRISM_MODEL_CONFIG_SHA256}" \
       ai.sparksnail.prism.kv.compatibility-id="${PRISM_KV_COMPATIBILITY_ID}"
+
+# Keep runtime writes on explicitly writable paths. The model and application
+# files remain owned by root and are read-only to this UID.
+RUN addgroup --system --gid 10001 prism && \
+    adduser --system --uid 10001 --ingroup prism --no-create-home prism && \
+    mkdir -p /var/run/prism/pair-probes /var/run/prism/incarnation \
+      /var/run/prism/triton /var/run/prism/.cache /opt/prism/build && \
+    chown -R prism:prism /var/run/prism /opt/prism
+USER prism
 
 EXPOSE 8001 29500
 STOPSIGNAL SIGTERM
