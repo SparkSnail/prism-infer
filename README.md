@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="#features"><b>Features</b></a> &middot;
-  <a href="#performance-snapshot"><b>Performance</b></a> &middot;
+  <a href="#reference-performance-snapshot"><b>Performance</b></a> &middot;
   <a href="#installation"><b>Installation</b></a> &middot;
   <a href="#quick-start"><b>Quick Start</b></a> &middot;
   <a href="#testing"><b>Testing</b></a> &middot;
