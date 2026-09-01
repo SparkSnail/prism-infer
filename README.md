@@ -179,3 +179,7 @@ See the [benchmark guide](bench/README.md) for command examples, metric definiti
 ## License
 
 [MIT](LICENSE)
+
+Container profiles include Qwen3 model materials under Apache-2.0. See the
+[third-party model notices](licenses/README.md) for the attribution and
+corresponding license text.

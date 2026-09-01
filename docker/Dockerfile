@@ -248,6 +248,9 @@ FROM model-files-${PRISM_IMAGE_VARIANT} AS selected-profile
 
 COPY pyproject.toml README.md LICENSE ./
 COPY prism_infer ./prism_infer
+COPY licenses/README.md /opt/prism/licenses/README.md
+COPY licenses/QWEN3-MODEL-NOTICE.txt /opt/prism/licenses/QWEN3-MODEL-NOTICE.txt
+COPY licenses/APACHE-2.0.txt /opt/prism/licenses/APACHE-2.0.txt
 
 # A source revision is recommended for published images.  ``unknown`` keeps a
 # plain local build usable while making the missing provenance explicit.

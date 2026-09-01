@@ -42,6 +42,8 @@ docker build \
 
 The worker validates `config.json`, tokenizer metadata, and every safetensors file against the cache manifest before producing an image. A missing marker, mismatched revision, missing file, or SHA-256 mismatch fails the build. Keep model bytes outside the application build context so they are supplied only through `model-cache`.
 
+The image also carries the Qwen3 attribution notice and Apache-2.0 license under `/opt/prism/licenses/`. The source copies are documented in the repository [third-party notices](../licenses/README.md).
+
 ## Create cache identity
 
 After acquiring a model by your own approved process, create the offline cache identity once. This command writes both required identity files and records a hash for every model file:

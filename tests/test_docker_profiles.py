@@ -12,6 +12,9 @@ from prism_infer.server.model_profile import (
 ROOT = Path(__file__).parents[1]
 DOCKERFILE = ROOT / "docker" / "Dockerfile"
 DOCKER_GUIDE = DOCKERFILE.parent / "README.md"
+LICENSE_README = ROOT / "licenses" / "README.md"
+MODEL_NOTICE = ROOT / "licenses" / "QWEN3-MODEL-NOTICE.txt"
+MODEL_LICENSE = ROOT / "licenses" / "APACHE-2.0.txt"
 
 
 def _instructions():
@@ -199,6 +202,29 @@ def test_docker_guide_documents_required_model_context():
     assert "<release-tag>" in guide
     assert not re.search(r"\bv\d+\.\d+\.\d+\b", guide)
     assert "[Docker guide](docker/README.md)" in readme
+    assert "[third-party notices](../licenses/README.md)" in guide
+    assert "[third-party model notices](licenses/README.md)" in readme
+
+
+def test_dockerfile_carries_qwen_notice_and_license_into_the_image():
+    text = DOCKERFILE.read_text(encoding="utf-8")
+
+    for path in (LICENSE_README, MODEL_NOTICE, MODEL_LICENSE):
+        assert path.is_file()
+    notice = MODEL_NOTICE.read_text(encoding="utf-8")
+    assert "Qwen3-0.6B" in notice
+    assert "Qwen3-8B" in notice
+    assert "Apache License, Version 2.0" in notice
+    assert "/opt/prism/licenses/APACHE-2.0.txt" in notice
+    assert "https://huggingface.co/Qwen/Qwen3-0.6B/blob/main/LICENSE" in notice
+    assert "https://huggingface.co/Qwen/Qwen3-8B/blob/main/LICENSE" in notice
+    assert "Copyright 2024 Alibaba Cloud" in MODEL_LICENSE.read_text(encoding="utf-8")
+    for name in (
+        "README.md",
+        "QWEN3-MODEL-NOTICE.txt",
+        "APACHE-2.0.txt",
+    ):
+        assert f"COPY licenses/{name} /opt/prism/licenses/{name}" in text
 
 
 def test_performance_model_has_one_copy_layer_per_weight_shard():
