@@ -9,7 +9,9 @@ from prism_infer.server.model_profile import (
 )
 
 
-DOCKERFILE = Path(__file__).parents[1] / "Dockerfile"
+ROOT = Path(__file__).parents[1]
+DOCKERFILE = ROOT / "docker" / "Dockerfile"
+DOCKER_GUIDE = DOCKERFILE.parent / "README.md"
 
 
 def _instructions():
@@ -98,6 +100,12 @@ def test_image_variant_arg_is_global_and_resolves_both_named_stages():
         _resolve_profile_stage("main")
 
 
+def test_docker_definition_and_guide_have_one_dedicated_location():
+    assert DOCKERFILE.is_file()
+    assert DOCKER_GUIDE.is_file()
+    assert not (ROOT / "Dockerfile").exists()
+
+
 @pytest.mark.parametrize(
     ("stage", "next_marker", "profile", "variant"),
     [
@@ -166,7 +174,7 @@ def test_model_staging_uses_only_the_local_named_context():
     assert "model-cache is missing .prism-model-revision" in text
     assert ".prism-model-manifest.json" in text
     assert "write_text" not in text.split("FROM profile-${PRISM_IMAGE_VARIANT} AS model-staging", 1)[1].split("PY", 1)[0]
-    assert (DOCKERFILE.parent / "scripts" / "create_model_cache_manifest.py").is_file()
+    assert (ROOT / "scripts" / "create_model_cache_manifest.py").is_file()
 
 
 def test_docker_installs_all_direct_runtime_dependencies():
@@ -180,12 +188,15 @@ def test_docker_installs_all_direct_runtime_dependencies():
         assert requirement in text
 
 
-def test_docker_readme_documents_required_model_context():
-    readme = (DOCKERFILE.parent / "README.md").read_text(encoding="utf-8")
+def test_docker_guide_documents_required_model_context():
+    guide = DOCKER_GUIDE.read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "--build-context model-cache=" in readme
-    assert "no model download occurs during the image build" in readme
-    assert "Qwen3-8B" in readme
+    assert "-f docker/Dockerfile" in guide
+    assert "--build-context model-cache=" in guide
+    assert "never downloads a model" in guide
+    assert "Qwen3-8B" in guide
+    assert "[Docker guide](docker/README.md)" in readme
 
 
 def test_performance_model_has_one_copy_layer_per_weight_shard():

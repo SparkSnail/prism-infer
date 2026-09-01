@@ -224,7 +224,7 @@ def test_worker_runtime_and_image_pin_httpx_dependency():
     project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     dependencies = project["project"]["dependencies"]
     assert any(value.startswith("httpx>=") for value in dependencies)
-    dockerfile = (root / "Dockerfile").read_text(encoding="utf-8")
+    dockerfile = (root / "docker" / "Dockerfile").read_text(encoding="utf-8")
     assert '"httpx==0.28.1"' in dockerfile
     assert "import flash_attn, httpx, torch, triton" in dockerfile
 

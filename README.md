@@ -40,14 +40,7 @@ In multi-node deployments, `prism-infer` provides the GPU workers that execute p
 
 ## Reference Performance Snapshot
 
-This immutable historical reference measures the end-to-end Prism stack, not
-an isolated benchmark of either repository. `prism-serve` applies optional
-prefix-affinity routing and coordinates the `prism-infer` prefill/decode
-workers. On the recorded model, hardware, topology, request mix, and
-concurrency, affinity lowered time-to-first-token and end-to-end latency while
-increasing completed-request throughput. The table keeps the decode trade-off
-visible. It is a controlled paired benchmark for the fixed 2P2D setup, not a
-production SLO or a claim about the current working tree.
+This immutable historical reference measures the end-to-end Prism stack, not an isolated benchmark of either repository. `prism-serve` applies optional prefix-affinity routing and coordinates the `prism-infer` prefill/decode workers. On the recorded model, hardware, topology, request mix, and concurrency, affinity lowered time-to-first-token and end-to-end latency while increasing completed-request throughput. The table keeps the decode trade-off visible. It is a controlled paired benchmark for the fixed 2P2D setup, not a production SLO or a claim about the current working tree.
 
 **Headline:** With affinity enabled, TTFT p50 is 64.9% lower, E2E p50 is 33.4% lower, and successful request throughput is 35.1% higher on this workload. TPOT rises, so this is a workload-specific prefix-reuse result, not a blanket speedup.
 
@@ -69,8 +62,7 @@ production SLO or a claim about the current working tree.
 | Successful requests/s | 6.274584 | 8.475600 | 35.078% higher |
 | Successful output tokens/s | 200.7867 | 271.2192 | 35.078% higher |
 
-The immutable result record and input provenance are maintained in the
-companion [`prism-serve` benchmark archive](https://github.com/SparkSnail/prism-serve/tree/main/bench/results).
+The immutable result record and input provenance are maintained in the companion [`prism-serve` benchmark archive](https://github.com/SparkSnail/prism-serve/tree/main/bench/results).
 
 ## Installation
 
@@ -83,14 +75,10 @@ Runtime support:
 
 The package has two install paths:
 
-- **CPU/control-plane:** installs the Python runtime needed by tests and worker
-  protocol tooling. It does not execute model attention.
-- **GPU inference:** requires Linux/WSL2, an NVIDIA CUDA runtime, a matching
-  PyTorch/Triton pair, and `flash-attn`.
+- **CPU/control-plane:** installs the Python runtime needed by tests and worker protocol tooling. It does not execute model attention.
+- **GPU inference:** requires Linux/WSL2, an NVIDIA CUDA runtime, a matching PyTorch/Triton pair, and `flash-attn`.
 
-For the GPU stack, install the package first and then install a FlashAttention
-wheel matching the selected PyTorch/CUDA/Python/C++ ABI from the
-[flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases):
+For the GPU stack, install the package first and then install a FlashAttention wheel matching the selected PyTorch/CUDA/Python/C++ ABI from the [flash-attention releases](https://github.com/Dao-AILab/flash-attention/releases):
 
 ```bash
 pip install -e .
@@ -98,9 +86,7 @@ pip install "triton>=3,<3.3"
 pip install <matching-flash-attn-wheel>.whl
 ```
 
-The optional `.[gpu]` extra is available when your package index provides a
-compatible FlashAttention wheel. Installing FlashAttention from source needs a
-CUDA toolkit and `nvcc`, and can take substantially longer.
+The optional `.[gpu]` extra is available when your package index provides a compatible FlashAttention wheel. Installing FlashAttention from source needs a CUDA toolkit and `nvcc`, and can take substantially longer.
 
 Verify the environment:
 
@@ -121,79 +107,7 @@ pip install -e ".[test]"
 
 Windows users: run the commands above inside a WSL2 Ubuntu shell.
 
-### Docker
-
-The Dockerfile builds the pinned Linux/CUDA worker image and embeds model
-provenance. Model files are supplied through a local BuildKit named context;
-no model download occurs during the image build. Pass a parent directory that
-contains the profile directory, or pass the profile directory itself:
-
-```bash
-MODEL_CACHE="$HOME/models"
-docker build \
-  --build-context model-cache="$MODEL_CACHE" \
-  --build-arg PRISM_IMAGE_VARIANT=correctness \
-  --build-arg GIT_SHA="$(git rev-parse HEAD)" \
-  -t prism-infer:local .
-```
-
-For the performance profile, the cache must contain the pinned `Qwen3-8B`
-directory instead:
-
-```bash
-docker build \
-  --build-context model-cache="$HOME/models" \
-  --build-arg PRISM_IMAGE_VARIANT=performance \
-  --build-arg GIT_SHA="$(git rev-parse HEAD)" \
-  -t prism-infer:qwen3-8b .
-```
-
-The staging step checks `config.json`, tokenizer metadata, and every
-safetensors file against the cache's required
-`.prism-model-manifest.json`. The manifest records the model ID, model and
-tokenizer revisions, and SHA-256 for each file; a matching
-`.prism-model-revision` marker is also required. The build never creates a
-marker or silently labels unverified weights as pinned. Create the cache
-identity entirely offline after obtaining the model; this command writes both
-files:
-
-```bash
-python scripts/create_model_cache_manifest.py \
-  --model-dir "$HOME/models/Qwen3-8B" \
-  --model-id Qwen/Qwen3-8B \
-  --revision b968826d9c46dd6066d109eabc6255188de91218 \
-  --tokenizer-revision b968826d9c46dd6066d109eabc6255188de91218 \
-  --config-sha256 f7c4eadfbbf522470667b797a3c89be2524832d2d599797248dc304fff447c30
-```
-
-Keep the model cache outside the application build context so model bytes are
-not copied into the source context. A missing or mismatched manifest fails the
-build before any image is produced.
-
-For a published image, set `PRISM_RELEASE=true`; the build then rejects an
-unknown source revision:
-
-```bash
-docker build \
-  --build-context model-cache="$HOME/models" \
-  --build-arg PRISM_IMAGE_VARIANT=correctness \
-  --build-arg PRISM_RELEASE=true \
-  --build-arg GIT_SHA="$(git rev-parse HEAD)" \
-  -t prism-infer:<release> .
-```
-
-### Release tags
-
-The first public container release follows the package version `v0.3.0`:
-
-- `sparksnail/prism-infer:v0.3.0` - the Qwen3-0.6B correctness profile
-- `sparksnail/prism-infer:v0.3.0-qwen3-8b` - the Qwen3-8B performance profile
-
-The model-profile suffix is part of the tag because the images contain
-different pinned model artifacts. Tags are convenient release aliases; pin the
-image digest and matching source commit for a reproducible deployment or a
-paired benchmark. Create the Git release tag `v0.3.0` on the same clean source
-commit used for the image. Do not use `latest`.
+Container images, source builds, model-cache verification, and release tags are documented in the [Docker guide](docker/README.md).
 
 ## Model Download
 
@@ -258,13 +172,9 @@ PRISM_TEST_MOE_MODEL=~/models/Qwen3-30B-A3B python -m pytest tests/test_parity_e
 
 `bench/bench.py` measures **TTFT**, **prefill throughput**, **decode TPS**, and a **throughput-vs-batch-size** curve, for both Dense and MoE models.
 
-Pass `--model` (or set `PRISM_MODEL`) and use `--seed`, `--repetitions`, and
-`--output path.json` for reproducible runtime reports. The separate
-`bench/tp_parity.py` script is a TP correctness diagnostic, not a performance
-benchmark.
+Pass `--model` (or set `PRISM_MODEL`) and use `--seed`, `--repetitions`, and `--output path.json` for reproducible runtime reports. The separate `bench/tp_parity.py` script is a TP correctness diagnostic, not a performance benchmark.
 
-See the [benchmark guide](bench/README.md) for command examples, metric
-definitions, structured output, and multi-GPU notes.
+See the [benchmark guide](bench/README.md) for command examples, metric definitions, structured output, and multi-GPU notes.
 
 ## License
 
