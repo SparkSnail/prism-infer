@@ -196,6 +196,8 @@ def test_docker_guide_documents_required_model_context():
     assert "--build-context model-cache=" in guide
     assert "never downloads a model" in guide
     assert "Qwen3-8B" in guide
+    assert "<release-tag>" in guide
+    assert not re.search(r"\bv\d+\.\d+\.\d+\b", guide)
     assert "[Docker guide](docker/README.md)" in readme
 
 
